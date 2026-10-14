@@ -14,12 +14,13 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 
-def gate():
+def gate() -> Any:
     """Load the actual implementation or report the missing feature."""
     source = Path(__file__).with_name("secret_scan.py")
     if not source.exists():
@@ -35,8 +36,12 @@ def gate():
 
 
 def finding(
-    raw="unit-only-value", *, verified=False, error=None, path="tests/unit/example.py"
-):
+    raw: Any = "unit-only-value",
+    *,
+    verified: Any = False,
+    error: Any = None,
+    path: Any = "tests/unit/example.py",
+) -> Any:
     """Build synthetic scanner output for protocol tests."""
     row = {
         "SourceMetadata": {
@@ -52,9 +57,9 @@ def finding(
     return row
 
 
-def exception(row):
+def exception(row: Any) -> Any:
     """Build one exact exception for a synthetic finding."""
-    return {
+    result = {
         "id": "unit-fixture-1",
         "repository": "forlex-ai/unit",
         "detector": row["DetectorName"],
@@ -65,12 +70,1495 @@ def exception(row):
         "rationale": "Reviewed synthetic fixture, no live credential.",
         "expires": "2099-01-01",
     }
+    result["proof"] = proof_url(result)
+    return result
+
+
+def proof_url(row: Any) -> Any:
+    """Reference the exact inert fixture source, without a live proof fetch."""
+    return (
+        "https://github.com/"
+        + row["repository"]
+        + "/blob/"
+        + row["commit"]
+        + "/"
+        + urllib.parse.quote(row["path"], safe="/")
+    )
+
+
+def pr_api_fixture(module: Any) -> Any:
+    """Provide independently defined live GitHub facts and inspect every check write."""
+    repository = "forlex-ai/unit"
+    head = "a" * 40
+    base = "b" * 40
+    merge = "c" * 40
+    responses = {
+        "": {"full_name": repository, "default_branch": "main"},
+        "pulls/1": {
+            "state": "open",
+            "head": {"sha": head},
+            "base": {"ref": "test", "sha": "d" * 40, "repo": {"full_name": repository}},
+            "merge_commit_sha": merge,
+            "mergeable": True,
+        },
+        "git/ref/heads/test": {
+            "ref": "refs/heads/test",
+            "object": {"type": "commit", "sha": base},
+        },
+        "git/commits/" + merge: {
+            "sha": merge,
+            "parents": [{"sha": base}, {"sha": head}],
+        },
+    }
+    checks: dict[str, Any] = {}
+    calls: list[Any] = []
+
+    def api(repo: Any, suffix: Any, *, method: Any = "GET", body: Any = None) -> Any:
+        calls.append((method, suffix, body))
+        assert repo == repository
+        if method == "POST":
+            number = 3 + len(checks)
+            result = {
+                "id": number,
+                "head_sha": body["head_sha"],
+                "name": body["name"],
+                "app": {"id": 15368},
+                "status": body["status"],
+            }
+            checks["check-runs/" + str(number)] = result
+            return result
+        if suffix in checks:
+            if method == "PATCH":
+                checks[suffix] = {**checks[suffix], **body}
+            return checks[suffix]
+        if suffix not in responses:
+            raise module.SecretScanRefusalError("Unavailable synthetic API fact")
+        return responses[suffix]
+
+    module.github = api
+    event = {
+        "number": 1,
+        "repository": {"full_name": repository},
+        "pull_request": {
+            "head": {"sha": head},
+            "base": {"ref": "test", "sha": "d" * 40},
+        },
+    }
+    return event, responses, checks, calls
 
 
 class GateTests(unittest.TestCase):
     """Exercise redaction, exception boundaries and scanner failure behavior."""
 
-    def test_all_detection_states_block_by_default(self):
+    def test_branch_deletion_scans_retained_before_tip_instead_of_default_sha(
+        self,
+    ) -> None:
+        """Deleted branches bind a full scan to the retained deleted tip, never the
+        default head.
+                ## WRITTEN BY AI ##
+        """
+        module = gate()
+        event, _responses, checks, _calls = pr_api_fixture(module)
+        event.update(
+            ref="refs/heads/deleted", before="b" * 40, after="0" * 40, deleted=True
+        )
+        with patch.dict(os.environ, {"GITHUB_SHA": "a" * 40}):
+            source = module.context(event, "push", "forlex-ai/unit")
+        assert (source["head"], source["base"]) == ("b" * 40, None)
+        assert [check["head_sha"] for check in checks.values()] == ["b" * 40]
+        assert [check["name"] for check in checks.values()] == [
+            "TruffleHog history scan"
+        ]
+
+    def test_branch_deletion_without_a_valid_retained_tip_creates_no_check(
+        self,
+    ) -> None:
+        """Missing, zero and malformed deleted tips refuse before any default-head
+        check exists.
+                ## WRITTEN BY AI ##
+        """
+        for before in (None, "0" * 40, "B" * 40, "b" * 39):
+            with self.subTest(before=before):
+                module = gate()
+                event, _responses, _checks, calls = pr_api_fixture(module)
+                event.update(ref="refs/heads/deleted", after="0" * 40, deleted=True)
+                if before is not None:
+                    event["before"] = before
+                with (
+                    patch.dict(os.environ, {"GITHUB_SHA": "a" * 40}),
+                    self.assertRaises(ValueError),
+                ):
+                    module.context(event, "push", "forlex-ai/unit")
+                assert not any((method == "POST" for method, _, _ in calls))
+
+    def test_head_changing_during_merge_polling_refuses_the_stale_event(self) -> None:
+        """A ready prospective merge for a newer head cannot reuse an older PR event.
+        ## WRITTEN BY AI ##
+        """
+        module = gate()
+        event, _responses, _checks, calls = pr_api_fixture(module)
+        api = module.github
+        reads = 0
+
+        def moving(
+            repo: Any, suffix: Any, *, method: Any = "GET", body: Any = None
+        ) -> Any:
+            nonlocal reads
+            result = api(repo, suffix, method=method, body=body)
+            if suffix == "pulls/1":
+                reads += 1
+                if reads == 1:
+                    return {**result, "mergeable": None, "merge_commit_sha": None}
+                return {**result, "head": {"sha": "e" * 40}}
+            if suffix == "git/commits/" + "c" * 40:
+                return {**result, "parents": [{"sha": "b" * 40}, {"sha": "e" * 40}]}
+            return result
+
+        module.github = moving
+        with patch.object(module.time, "sleep"), self.assertRaises(ValueError):
+            module.context(event, "pull_request_target", "forlex-ai/unit")
+        assert reads > 1
+        assert not any((method == "POST" for method, _, _ in calls))
+
+    def test_history_checks_have_a_distinct_fixed_name_from_pr_admission(self) -> None:
+        """A push or complete-history success cannot satisfy the fixed PR gate name.
+        ## WRITTEN BY AI ##
+        """
+        for kind, number in (
+            ("push", 0),
+            ("schedule", 0),
+            ("workflow_dispatch", 0),
+            ("workflow_dispatch", 1),
+            ("pull_request_target", 0),
+        ):
+            with self.subTest(kind=kind, number=number):
+                module = gate()
+                event, _responses, checks, calls = pr_api_fixture(module)
+                event["before"] = "b" * 40
+                with patch.dict(os.environ, {"GITHUB_SHA": "a" * 40}):
+                    source = module.context(event, kind, "forlex-ai/unit", number)
+                expected = (
+                    "TruffleHog secret scan"
+                    if source["pr"]
+                    else "TruffleHog history scan"
+                )
+                assert {check["name"] for check in checks.values()} == {expected}
+                report = {
+                    **source,
+                    "version": 1,
+                    "result": "pass",
+                    "blocked": 0,
+                    "suppressed": 0,
+                    "commit_count": 3,
+                }
+                if source["pr"]:
+                    report.update(
+                        candidate_policy_validated=True,
+                        candidate_policy_source=source["merge"],
+                        candidate_policy_blob="f" * 40,
+                    )
+                assert module.publish(source, report)["conclusion"] == "success"
+                assert {
+                    body["output"]["title"]
+                    for method, _, body in calls
+                    if method == "PATCH"
+                } == {expected}
+
+    def test_missing_old_push_tip_scans_all_reachable_new_history_but_pr_is_strict(
+        self,
+    ) -> None:
+        """An orphaned force-push source is complete without the old tip; PR scope
+        remains exact.
+                ## WRITTEN BY AI ##
+        """
+        module = gate()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)  # noqa: S603, S607
+            for message in ("first", "second"):
+                subprocess.run(  # noqa: S603
+                    [  # noqa: S607
+                        "git",
+                        "-C",
+                        str(repo),
+                        "-c",
+                        "user.name=Unit",
+                        "-c",
+                        "user.email=unit@example.invalid",
+                        "commit",
+                        "--allow-empty",
+                        "-qm",
+                        message,
+                    ],
+                    check=True,
+                )
+            head = subprocess.check_output(  # noqa: S603
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],  # noqa: S607
+                text=True,  # noqa: S607
+            ).strip()  # fmt: skip
+            expected = subprocess.check_output(  # noqa: S603
+                ["git", "-C", str(repo), "rev-list", "HEAD"],  # noqa: S607
+                text=True,  # noqa: S607
+            ).splitlines()  # fmt: skip
+            assert module.git_range(repo, head, "f" * 40, full_if_nonforward=True) == (
+                None,
+                expected,
+            )
+            with self.assertRaises(ValueError):
+                module.git_range(repo, head, "f" * 40)
+            with self.assertRaises(ValueError):
+                module.git_range(repo, "e" * 40, "f" * 40, full_if_nonforward=True)
+
+    def test_pending_mergeability_is_polled_before_creating_either_check(self) -> None:
+        """GitHub's asynchronous null mergeability is retried using authenticated
+        current facts.
+                ## WRITTEN BY AI ##
+        """
+        module = gate()
+        event, _responses, checks, _calls = pr_api_fixture(module)
+        api = module.github
+        reads = 0
+
+        def pending(
+            repo: Any, suffix: Any, *, method: Any = "GET", body: Any = None
+        ) -> Any:
+            nonlocal reads
+            result = api(repo, suffix, method=method, body=body)
+            if method == "GET" and suffix == "pulls/1":
+                reads += 1
+                if reads < 3:
+                    return {**result, "mergeable": None, "merge_commit_sha": None}
+            if method == "POST":
+                assert reads >= 3
+            return result
+
+        module.github = pending
+        with patch.object(module.time, "sleep"):
+            source = module.context(event, "pull_request_target", "forlex-ai/unit")
+        assert reads == 3
+        assert (source["head"], source["base"], source["merge"]) == (
+            "a" * 40,
+            "b" * 40,
+            "c" * 40,
+        )
+        assert len(checks) == 2
+
+    def test_polling_waits_for_exact_current_prospective_merge_parents(self) -> None:
+        """A stale merge object cannot authorize checks even after mergeability becomes
+        true.
+                ## WRITTEN BY AI ##
+        """
+        module = gate()
+        event, _responses, checks, _calls = pr_api_fixture(module)
+        api = module.github
+        reads = 0
+
+        def stale_merge(
+            repo: Any, suffix: Any, *, method: Any = "GET", body: Any = None
+        ) -> Any:
+            nonlocal reads
+            result = api(repo, suffix, method=method, body=body)
+            if suffix == "git/commits/" + "c" * 40:
+                reads += 1
+                if reads < 2:
+                    return {**result, "parents": [{"sha": "d" * 40}, {"sha": "a" * 40}]}
+            if method == "POST":
+                assert reads >= 2
+            return result
+
+        module.github = stale_merge
+        with patch.object(module.time, "sleep"):
+            source = module.context(event, "pull_request_target", "forlex-ai/unit")
+        assert source["base"] == "b" * 40
+        assert reads == 2
+        assert len(checks) == 2
+
+    def test_publication_and_cleanup_reject_checks_from_the_other_scan_mode(
+        self,
+    ) -> None:
+        """Name separation remains exact during preflight, terminal writes and cleanup.
+        ## WRITTEN BY AI ##
+        """
+        for kind in ("push", "pull_request_target"):
+            with self.subTest(kind=kind):
+                module = gate()
+                event, _responses, checks, calls = pr_api_fixture(module)
+                event["before"] = "b" * 40
+                with patch.dict(os.environ, {"GITHUB_SHA": "a" * 40}):
+                    source = module.context(event, kind, "forlex-ai/unit")
+                wrong = (
+                    "TruffleHog secret scan"
+                    if kind == "push"
+                    else "TruffleHog history scan"
+                )
+                for check in checks.values():
+                    check["name"] = wrong
+                with self.assertRaises(ValueError):
+                    module.publish(source, {"result": "error"})
+                assert not any((method == "PATCH" for method, _, _ in calls))
+
+    def test_publication_preflight_failure_cleans_independently_verified_checks(
+        self,
+    ) -> None:
+        """Initial identity outages and mismatches must not strand the other original
+        check.
+                ## WRITTEN BY AI ##
+        """
+        for failed_target in ("check-runs/3", "check-runs/4"):
+            for fault in ("once", "outage", "foreign"):
+                with self.subTest(target=failed_target, fault=fault):
+                    module = gate()
+                    event, _responses, checks, calls = pr_api_fixture(module)
+                    source = module.context(
+                        event, "pull_request_target", "forlex-ai/unit"
+                    )
+                    report = {
+                        **source,
+                        "version": 1,
+                        "result": "pass",
+                        "blocked": 0,
+                        "suppressed": 0,
+                        "commit_count": 3,
+                        "candidate_policy_validated": True,
+                        "candidate_policy_source": source["merge"],
+                        "candidate_policy_blob": "f" * 40,
+                    }
+                    api = module.github
+                    failed = False
+                    if fault == "foreign":
+                        checks[failed_target]["app"]["id"] = 46505
+
+                    def failing(
+                        repo: Any,
+                        suffix: Any,
+                        *,
+                        method: Any = "GET",
+                        body: Any = None,
+                        failed_target: Any = failed_target,
+                        fault: Any = fault,
+                        api: Any = api,
+                        calls: Any = calls,
+                        module: Any = module,
+                    ) -> Any:
+                        nonlocal failed
+                        if (
+                            method == "GET"
+                            and suffix == failed_target
+                            and fault != "foreign"
+                            and (not failed or fault == "outage")
+                        ):
+                            failed = True
+                            calls.append((method, suffix, body))
+                            raise module.SecretScanRefusalError(
+                                "private-preflight-response-marker"
+                            )
+                        return api(repo, suffix, method=method, body=body)
+
+                    module.github = failing
+                    with self.assertRaises(ValueError) as refused:
+                        module.publish(source, report)
+                    assert "private-preflight-response-marker" not in str(
+                        refused.exception
+                    )
+                    other = (
+                        "check-runs/4"
+                        if failed_target == "check-runs/3"
+                        else "check-runs/3"
+                    )
+                    assert checks[other]["status"] == "completed"
+                    assert checks[other]["conclusion"] == "failure"
+                    patches = [
+                        (suffix, body)
+                        for method, suffix, body in calls
+                        if method == "PATCH"
+                    ]
+                    assert all((body["conclusion"] == "failure" for _, body in patches))
+                    if fault == "once":
+                        assert checks[failed_target]["conclusion"] == "failure"
+                    else:
+                        assert not any(
+                            (suffix == failed_target for suffix, _ in patches)
+                        )
+                    for index, (method, suffix, _) in enumerate(calls):
+                        if method == "PATCH":
+                            assert calls[index - 1] == ("GET", suffix, None)
+
+    def test_unready_or_conflicting_merge_polling_is_bounded_and_creates_no_checks(
+        self,
+    ) -> None:
+        """Pending, conflicting and malformed readiness cannot become premature
+        admission.
+                ## WRITTEN BY AI ##
+        """
+        for readiness in (None, False, "true", 1):
+            with self.subTest(readiness=readiness):
+                module = gate()
+                event, responses, _checks, calls = pr_api_fixture(module)
+                responses["pulls/1"]["mergeable"] = readiness
+                with patch.object(module.time, "sleep"), self.assertRaises(ValueError):
+                    module.context(event, "pull_request_target", "forlex-ai/unit")
+                reads = sum(
+                    method == "GET" and suffix == "pulls/1"
+                    for method, suffix, _ in calls
+                )
+                assert reads >= 1
+                assert reads <= 5
+                if readiness is None:
+                    assert reads > 1
+                assert not any((method == "POST" for method, _, _ in calls))
+
+    def test_context_cli_persistence_errors_fail_all_acknowledged_owned_checks(  # noqa: C901
+        self,
+    ) -> None:
+        """Local context/output write or close failures cannot strand created checks.
+        ## WRITTEN BY AI ##
+        """
+        for kind in ("pull_request_target", "push"):
+            for fault in (
+                "context",
+                "github_output",
+                "missing_output",
+                "stream_write",
+                "stream_close",
+            ):
+                with self.subTest(kind=kind, fault=fault):
+                    module = gate()
+                    event, responses, checks, calls = pr_api_fixture(module)
+                    event["before"] = "b" * 40
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        ep, output, gha = root / "event", root / "context", root / "gha"
+                        ep.write_text(json.dumps(event))
+                        if fault == "context":
+                            output.mkdir()
+                        elif fault == "github_output":
+                            gha.mkdir()
+                        argv = [
+                            "secret_scan.py",
+                            "context",
+                            "--event",
+                            str(ep),
+                            "--kind",
+                            kind,
+                            "--repository",
+                            "forlex-ai/unit",
+                            "--output",
+                            str(output),
+                        ]
+
+                        class FailingOutput(io.StringIO):
+                            def write(self, value: Any, fault: Any = fault) -> Any:
+                                super().write(value)
+                                if fault == "stream_write":
+                                    raise OSError("private-context-write-marker")
+                                return len(value)
+
+                            def __exit__(self, *args: Any, fault: Any = fault) -> Any:
+                                if fault == "stream_close":
+                                    raise OSError("private-context-write-marker")
+                                return super().__exit__(*args)
+
+                        stream = FailingOutput()
+                        console = io.StringIO()
+                        with (
+                            patch.object(sys, "argv", argv),
+                            patch.dict(
+                                os.environ,
+                                {"GITHUB_OUTPUT": str(gha), "GITHUB_SHA": "a" * 40},
+                            ),
+                            patch("sys.stdout", console),
+                        ):
+                            if fault == "missing_output":
+                                os.environ.pop("GITHUB_OUTPUT")
+                            if fault in {"stream_write", "stream_close"}:
+                                real_open = Path.open
+
+                                def opening(
+                                    path: Any,
+                                    *args: Any,
+                                    real_open: Any = real_open,
+                                    stream: Any = stream,
+                                    gha: Any = gha,
+                                    **kwargs: Any,
+                                ) -> Any:
+                                    if path == gha:
+                                        return stream
+                                    return real_open(path, *args, **kwargs)
+
+                                with patch.object(module.Path, "open", opening):
+                                    assert module.main() == 1
+                            else:
+                                assert module.main() == 1
+                        assert "private-context-write-marker" not in console.getvalue()
+                        assert "head=" not in console.getvalue()
+                        assert '"check_id"' not in console.getvalue()
+                    assert len(checks) == (2 if kind == "pull_request_target" else 1)
+                    assert all(
+                        check.get("conclusion") == "failure"
+                        and check["status"] == "completed"
+                        for check in checks.values()
+                    )
+                    patches = [
+                        (i, suffix, body)
+                        for i, (method, suffix, body) in enumerate(calls)
+                        if method == "PATCH"
+                    ]
+                    assert len(patches) == len(checks)
+                    for index, suffix, body in patches:
+                        assert calls[index - 1] == ("GET", suffix, None)
+                        assert body["conclusion"] == "failure"
+
+    def test_context_persistence__a1a9ec74(
+        self,
+    ) -> None:
+        """The CLI guard uses verified cleanup without letting one target block another.
+        ## WRITTEN BY AI ##
+        """
+        for fault in ("foreign", "unavailable"):
+            module = gate()
+            event, responses, checks, calls = pr_api_fixture(module)
+            api = module.github
+
+            def failed_read(
+                repo: Any,
+                suffix: Any,
+                *,
+                method: Any = "GET",
+                body: Any = None,
+                api: Any = api,
+                calls: Any = calls,
+                checks: Any = checks,
+                fault: Any = fault,
+                module: Any = module,
+            ) -> Any:
+                if method == "GET" and suffix == "check-runs/3":
+                    if fault == "foreign":
+                        checks[suffix]["app"]["id"] = 46505
+                    else:
+                        calls.append((method, suffix, body))
+                        raise module.SecretScanRefusalError(
+                            "private-context-api-marker"
+                        )
+                return api(repo, suffix, method=method, body=body)
+
+            module.github = failed_read
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                ep, output, gha = root / "event", root / "context", root / "gha"
+                ep.write_text(json.dumps(event))
+                output.mkdir()
+                argv = [
+                    "secret_scan.py",
+                    "context",
+                    "--event",
+                    str(ep),
+                    "--kind",
+                    "pull_request_target",
+                    "--repository",
+                    "forlex-ai/unit",
+                    "--output",
+                    str(output),
+                ]
+                console = io.StringIO()
+                with (
+                    patch.object(sys, "argv", argv),
+                    patch.dict(os.environ, {"GITHUB_OUTPUT": str(gha)}),
+                    patch("sys.stdout", console),
+                ):
+                    assert module.main() == 1
+                assert "private-context-api-marker" not in console.getvalue()
+                assert not gha.exists()
+            assert checks["check-runs/3"]["status"] == "in_progress"
+            assert checks["check-runs/4"].get("conclusion") == "failure"
+            assert [suffix for method, suffix, _ in calls if method == "PATCH"] == [
+                "check-runs/4"
+            ]
+
+    def test_second_context_creation_failure_closes_only_the_known_original_check(
+        self,
+    ) -> None:
+        """An unacknowledged second POST cannot strand the acknowledged owned head.
+        ## WRITTEN BY AI ##
+        """
+        for lost_ack in (False, True):
+            module = gate()
+            event, responses, checks, calls = pr_api_fixture(module)
+            api = module.github
+            posts = 0
+
+            def failing(
+                repo: Any,
+                suffix: Any,
+                *,
+                method: Any = "GET",
+                body: Any = None,
+                api: Any = api,
+                calls: Any = calls,
+                lost_ack: Any = lost_ack,
+                module: Any = module,
+            ) -> Any:
+                nonlocal posts
+                if method == "POST":
+                    posts += 1
+                    if posts == 2:
+                        if lost_ack:
+                            api(repo, suffix, method=method, body=body)
+                        else:
+                            calls.append((method, suffix, body))
+                        raise module.SecretScanRefusalError("private-response-marker")
+                return api(repo, suffix, method=method, body=body)
+
+            module.github = failing
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                ep, output, gha = root / "event", root / "context", root / "gha"
+                ep.write_text(json.dumps(event))
+                argv = [
+                    "secret_scan.py",
+                    "context",
+                    "--event",
+                    str(ep),
+                    "--kind",
+                    "pull_request_target",
+                    "--repository",
+                    "forlex-ai/unit",
+                    "--output",
+                    str(output),
+                ]
+                console = io.StringIO()
+                with (
+                    patch.object(sys, "argv", argv),
+                    patch.dict(os.environ, {"GITHUB_OUTPUT": str(gha)}),
+                    patch("sys.stdout", console),
+                ):
+                    assert module.main() == 1
+                assert not output.exists()
+                assert not gha.exists()
+                assert "private-response-marker" not in console.getvalue()
+            assert checks["check-runs/3"].get("conclusion") == "failure"
+            assert checks["check-runs/3"]["status"] == "completed"
+            assert [suffix for method, suffix, _ in calls if method == "PATCH"] == [
+                "check-runs/3"
+            ]
+            if lost_ack:
+                assert checks["check-runs/4"]["status"] == "in_progress"
+
+    def test_context_cleanup_cannot_mutate_foreign_or_unverifiable_checks(self) -> None:
+        """Cleanup requires a fresh exact identity and never guesses an unknown POST id.
+        ## WRITTEN BY AI ##
+        """
+        for changed in ("id", "head", "name", "app", "read_outage"):
+            module = gate()
+            event, responses, checks, calls = pr_api_fixture(module)
+            api = module.github
+            posts = 0
+
+            def failing(
+                repo: Any,
+                suffix: Any,
+                *,
+                method: Any = "GET",
+                body: Any = None,
+                api: Any = api,
+                calls: Any = calls,
+                changed: Any = changed,
+                checks: Any = checks,
+                module: Any = module,
+            ) -> Any:
+                nonlocal posts
+                if method == "POST":
+                    posts += 1
+                    if posts == 2:
+                        calls.append((method, suffix, body))
+                        check = checks["check-runs/3"]
+                        if changed == "id":
+                            check["id"] = 3.0
+                        elif changed == "head":
+                            check["head_sha"] = "e" * 40
+                        elif changed == "name":
+                            check["name"] = "Other check"
+                        elif changed == "app":
+                            check["app"]["id"] = 15368.0
+                        raise module.SecretScanRefusalError("private-response-marker")
+                if (
+                    changed == "read_outage"
+                    and method == "GET"
+                    and suffix == "check-runs/3"
+                ):
+                    calls.append((method, suffix, body))
+                    raise module.SecretScanRefusalError("private-response-marker")
+                return api(repo, suffix, method=method, body=body)
+
+            module.github = failing
+            with self.assertRaises(ValueError) as refused:
+                module.context(event, "pull_request_target", "forlex-ai/unit")
+            assert "private-response-marker" not in str(refused.exception)
+            assert ("GET", "check-runs/3", None) in calls
+            assert not any((method == "PATCH" for method, _, _ in calls))
+
+    def test_context_refuses_non_integer_created_check_identity(self) -> None:
+        """Only an acknowledged positive integer id identifies a created original check.
+        ## WRITTEN BY AI ##
+        """
+        for identity in (True, 3.0, "3", None, 0, -1):
+            module = gate()
+            event, responses, checks, calls = pr_api_fixture(module)
+            api = module.github
+
+            def invalid(
+                repo: Any,
+                suffix: Any,
+                *,
+                method: Any = "GET",
+                body: Any = None,
+                api: Any = api,
+                identity: Any = identity,
+            ) -> Any:
+                result = api(repo, suffix, method=method, body=body)
+                return {**result, "id": identity} if method == "POST" else result
+
+            module.github = invalid
+            with self.assertRaises(ValueError):
+                module.context(event, "pull_request_target", "forlex-ai/unit")
+            assert not any((method == "PATCH" for method, _, _ in calls))
+
+    def test_partial_publication_failure_downgrades_each_verified_original_check(
+        self,
+    ) -> None:
+        """A failed or lost completion acknowledgement never leaves acknowledged
+        success.
+                ## WRITTEN BY AI ##
+        """
+        for failed_target in ("check-runs/3", "check-runs/4"):
+            for lost_ack in (False, True):
+                module = gate()
+                event, responses, checks, calls = pr_api_fixture(module)
+                source = module.context(event, "pull_request_target", "forlex-ai/unit")
+                report = {
+                    **source,
+                    "version": 1,
+                    "result": "pass",
+                    "blocked": 0,
+                    "suppressed": 0,
+                    "commit_count": 3,
+                    "candidate_policy_validated": True,
+                    "candidate_policy_source": source["merge"],
+                    "candidate_policy_blob": "f" * 40,
+                }
+                api = module.github
+
+                def failing(
+                    repo: Any,
+                    suffix: Any,
+                    *,
+                    method: Any = "GET",
+                    body: Any = None,
+                    api: Any = api,
+                    calls: Any = calls,
+                    failed_target: Any = failed_target,
+                    lost_ack: Any = lost_ack,
+                    module: Any = module,
+                ) -> Any:
+                    if (
+                        method == "PATCH"
+                        and suffix == failed_target
+                        and body["conclusion"] == "success"
+                    ):
+                        if lost_ack:
+                            api(repo, suffix, method=method, body=body)
+                        else:
+                            calls.append((method, suffix, body))
+                        raise module.SecretScanRefusalError("private-response-marker")
+                    return api(repo, suffix, method=method, body=body)
+
+                module.github = failing
+                with self.assertRaises(ValueError) as refused:
+                    module.publish(source, report)
+                assert "private-response-marker" not in str(refused.exception)
+                assert [check.get("conclusion") for check in checks.values()] == [
+                    "failure",
+                    "failure",
+                ]
+                for suffix in ("check-runs/3", "check-runs/4"):
+                    writes = [
+                        i
+                        for i, (method, target, body) in enumerate(calls)
+                        if method == "PATCH"
+                        and target == suffix
+                        and body["conclusion"] == "failure"
+                    ]
+                    assert len(writes) == 1
+                    assert calls[writes[0] - 1] == ("GET", suffix, None)
+
+    def test_cleanup_continues_when_one_original_check_cannot_be_confirmed(  # noqa: C901
+        self,
+    ) -> None:
+        """An outage, foreign identity or lost cleanup ack cannot skip the other owned
+        target.
+                ## WRITTEN BY AI ##
+        """
+        for failed_target in ("check-runs/3", "check-runs/4"):
+            for fault in ("read", "write", "lost_ack", "unconfirmed", "foreign"):
+                module = gate()
+                event, responses, checks, calls = pr_api_fixture(module)
+                source = module.context(event, "pull_request_target", "forlex-ai/unit")
+                report = {
+                    **source,
+                    "version": 1,
+                    "result": "pass",
+                    "blocked": 0,
+                    "suppressed": 0,
+                    "commit_count": 3,
+                    "candidate_policy_validated": True,
+                    "candidate_policy_source": source["merge"],
+                    "candidate_policy_blob": "f" * 40,
+                }
+                api = module.github
+                cleaning = False
+
+                def failing(
+                    repo: Any,
+                    suffix: Any,
+                    *,
+                    method: Any = "GET",
+                    body: Any = None,
+                    api: Any = api,
+                    calls: Any = calls,
+                    checks: Any = checks,
+                    failed_target: Any = failed_target,
+                    fault: Any = fault,
+                    module: Any = module,
+                ) -> Any:
+                    nonlocal cleaning
+                    if (
+                        method == "PATCH"
+                        and suffix == "check-runs/4"
+                        and body["conclusion"] == "success"
+                    ):
+                        calls.append((method, suffix, body))
+                        cleaning = True
+                        if fault == "foreign":
+                            checks[failed_target]["app"]["id"] = 46505
+                        raise module.SecretScanRefusalError("private-response-marker")
+                    if cleaning and suffix == failed_target:
+                        if fault == "read" and method == "GET":
+                            calls.append((method, suffix, body))
+                            raise module.SecretScanRefusalError(
+                                "private-response-marker"
+                            )
+                        if method == "PATCH":
+                            if fault == "write":
+                                calls.append((method, suffix, body))
+                                raise module.SecretScanRefusalError(
+                                    "private-response-marker"
+                                )
+                            result = api(repo, suffix, method=method, body=body)
+                            if fault == "lost_ack":
+                                raise module.SecretScanRefusalError(
+                                    "private-response-marker"
+                                )
+                            if fault == "unconfirmed":
+                                return {**result, "status": "in_progress"}
+                            return result
+                    return api(repo, suffix, method=method, body=body)
+
+                module.github = failing
+                with self.assertRaises(ValueError) as refused:
+                    module.publish(source, report)
+                assert "private-response-marker" not in str(refused.exception)
+                other = (
+                    "check-runs/4"
+                    if failed_target == "check-runs/3"
+                    else "check-runs/3"
+                )
+                assert checks[other].get("conclusion") == "failure"
+                assert checks[other]["status"] == "completed"
+                assert ("GET", failed_target, None) in calls
+                if fault == "foreign":
+                    assert not any(
+                        (
+                            method == "PATCH"
+                            and target == failed_target
+                            and (body["conclusion"] == "failure")
+                            for method, target, body in calls
+                        )
+                    )
+
+    def test_pr_context_uses_current_base_ref_and_binds_both_evaluated_commits(
+        self,
+    ) -> None:
+        """A cached Pulls API base cannot select obsolete qualification history.
+        ## WRITTEN BY AI ##
+        """
+        module = gate()
+        event, responses, checks, calls = pr_api_fixture(module)
+        source = module.context(event, "pull_request_target", "forlex-ai/unit")
+        assert source["base"] == "b" * 40
+        assert source["base_ref"] == "test"
+        assert source["merge"] == "c" * 40
+        assert source["check_id"] == 3
+        assert source["merge_check_id"] == 4
+        assert [c["head_sha"] for c in checks.values()] == ["a" * 40, "c" * 40]
+        assert ("GET", "git/ref/heads/test", None) in calls
+
+    def test_unaccepted_base_and_wrong_prospective_parents_cannot_create_checks(
+        self,
+    ) -> None:
+        """Auxiliary bases and stale/foreign merge results refuse before check creation.
+        ## WRITTEN BY AI ##
+        """
+        for changed in ["auxiliary", "parent", "reverse", "missing_merge", "bad_ref"]:
+            module = gate()
+            event, responses, checks, calls = pr_api_fixture(module)
+            if changed == "auxiliary":
+                responses["pulls/1"]["base"]["ref"] = "topic"
+            elif changed == "parent":
+                responses["git/commits/" + "c" * 40]["parents"][1]["sha"] = "e" * 40
+            elif changed == "reverse":
+                responses["git/commits/" + "c" * 40]["parents"].reverse()
+            elif changed == "missing_merge":
+                responses["pulls/1"]["merge_commit_sha"] = None
+            else:
+                responses["git/ref/heads/test"]["object"]["type"] = "tag"
+            with self.assertRaises(ValueError):
+                module.context(event, "pull_request_target", "forlex-ai/unit")
+            assert not checks
+            assert not any((method == "POST" for method, _, _ in calls))
+
+    def test_context_cli_outputs_merge_and_accepts_manifest_integration_branch(
+        self,
+    ) -> None:
+        """The owning manifest branch can replace the common test default explicitly.
+        ## WRITTEN BY AI ##
+        """
+        module = gate()
+        event, responses, checks, calls = pr_api_fixture(module)
+        responses["pulls/1"]["base"]["ref"] = "release"
+        responses["git/ref/heads/release"] = {
+            **responses.pop("git/ref/heads/test"),
+            "ref": "refs/heads/release",
+        }
+        event["pull_request"]["base"]["ref"] = "release"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ep = root / "event"
+            output = root / "context"
+            gha = root / "output"
+            ep.write_text(json.dumps(event))
+            argv = [
+                "secret_scan.py",
+                "context",
+                "--event",
+                str(ep),
+                "--kind",
+                "pull_request_target",
+                "--repository",
+                "forlex-ai/unit",
+                "--integration-branch",
+                "release",
+                "--output",
+                str(output),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.dict(os.environ, {"GITHUB_OUTPUT": str(gha)}),
+            ):
+                assert module.main() == 0
+            assert "merge=" + "c" * 40 + "\n" in gha.read_text()
+            assert json.loads(output.read_text())["integration_branch"] == "release"
+
+    def test_dual_check_publicati_89f50f69(
+        self,
+    ) -> None:
+        """Both immutable check targets complete only for the same qualified prospective
+        result.
+                ## WRITTEN BY AI ##
+        """
+        for changed in [
+            None,
+            "base",
+            "head",
+            "merge",
+            "report_merge",
+            "candidate_unvalidated",
+        ]:
+            module = gate()
+            event, responses, checks, calls = pr_api_fixture(module)
+            source = module.context(event, "pull_request_target", "forlex-ai/unit")
+            report = {
+                **source,
+                "version": 1,
+                "result": "pass",
+                "blocked": 0,
+                "suppressed": 0,
+                "commit_count": 3,
+                "candidate_policy_validated": True,
+                "candidate_policy_source": source["merge"],
+                "candidate_policy_blob": "f" * 40,
+            }
+            if changed == "base":
+                responses["git/ref/heads/test"]["object"]["sha"] = "e" * 40
+            elif changed == "head":
+                responses["pulls/1"]["head"]["sha"] = "e" * 40
+            elif changed == "merge":
+                responses["pulls/1"]["merge_commit_sha"] = "e" * 40
+            elif changed == "report_merge":
+                report["merge"] = "e" * 40
+            elif changed == "candidate_unvalidated":
+                report.pop("candidate_policy_validated")
+            result = module.publish(source, report)
+            expected = "success" if changed is None else "failure"
+            assert result["conclusion"] == expected
+            assert [c["conclusion"] for c in checks.values()] == [expected, expected]
+            assert [s for method, s, _ in calls if method == "PATCH"] == [
+                "check-runs/3",
+                "check-runs/4",
+            ]
+
+    def test_foreign_prospective_check_refuses_success_and_fails_only_verified_head(
+        self,
+    ) -> None:
+        """A foreign merge check remains untouched while the verified original head
+        fails safely.
+                ## WRITTEN BY AI ##
+        """
+        module = gate()
+        event, _responses, checks, calls = pr_api_fixture(module)
+        source = module.context(event, "pull_request_target", "forlex-ai/unit")
+        checks["check-runs/4"]["app"]["id"] = 46505
+        report = {
+            **source,
+            "version": 1,
+            "result": "pass",
+            "blocked": 0,
+            "suppressed": 0,
+            "commit_count": 3,
+            "candidate_policy_validated": True,
+            "candidate_policy_source": source["merge"],
+            "candidate_policy_blob": "f" * 40,
+        }
+        with self.assertRaises(ValueError):
+            module.publish(source, report)
+        assert [
+            (suffix, body["conclusion"])
+            for method, suffix, body in calls
+            if method == "PATCH"
+        ] == [("check-runs/3", "failure")]
+        assert checks["check-runs/3"]["status"] == "completed"
+        assert checks["check-runs/4"]["status"] == "in_progress"
+
+    def test_base_moving_between_dual_writes_downgrades_both_original_checks(
+        self,
+    ) -> None:
+        """A successful first write cannot remain qualified after live source changes.
+        ## WRITTEN BY AI ##
+        """
+        module = gate()
+        event, responses, checks, calls = pr_api_fixture(module)
+        source = module.context(event, "pull_request_target", "forlex-ai/unit")
+        api = module.github
+
+        def racing(
+            repo: Any, suffix: Any, *, method: Any = "GET", body: Any = None
+        ) -> Any:
+            result = api(repo, suffix, method=method, body=body)
+            if (
+                method == "PATCH"
+                and suffix == "check-runs/3"
+                and body["conclusion"] == "success"
+            ):
+                responses["git/ref/heads/test"]["object"]["sha"] = "e" * 40
+            return result
+
+        module.github = racing
+        report = {
+            **source,
+            "version": 1,
+            "result": "pass",
+            "blocked": 0,
+            "suppressed": 0,
+            "commit_count": 3,
+            "candidate_policy_validated": True,
+            "candidate_policy_source": source["merge"],
+            "candidate_policy_blob": "f" * 40,
+        }
+        result = module.publish(source, report)
+        assert result["conclusion"] == "failure"
+        assert [check["conclusion"] for check in checks.values()] == [
+            "failure",
+            "failure",
+        ]
+
+    def test_candidate_policy_is__d3ae1c42(
+        self,
+    ) -> None:
+        """Candidate executable helpers and symlink policy targets cannot run or change
+        authority.
+                ## WRITTEN BY AI ##
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)  # noqa: S603, S607
+            path = repo / ".forlex/security"
+            path.mkdir(parents=True)
+            marker = root / "executed"
+            outside = root / "outside-policy"
+            outside.write_text('{"version":1,"exceptions":[]}')
+            (path / "secret_scan.py").write_text(
+                "open(" + repr(str(marker)) + ',"w").write("executed")\n'
+            )
+            target = path / "exceptions.json"
+
+            def commit() -> Any:
+                subprocess.run(["git", "-C", str(repo), "add", "."], check=True)  # noqa: S603, S607
+                subprocess.run(  # noqa: S603
+                    [  # noqa: S607
+                        "git",
+                        "-C",
+                        str(repo),
+                        "-c",
+                        "user.name=Unit",
+                        "-c",
+                        "user.email=unit@example.invalid",
+                        "commit",
+                        "-qm",
+                        "policy",
+                    ],
+                    check=True,
+                )
+                return subprocess.check_output(  # noqa: S603
+                    ["git", "-C", str(repo), "rev-parse", "HEAD"],  # noqa: S607
+                    text=True,  # noqa: S607
+                ).strip()  # fmt: skip
+
+            target.write_text('{"version":1,"exceptions":[]}')
+            head = commit()
+            assert gate().validate_candidate_policy(repo, head)
+            target.write_text('{"version":1,"version":1,"exceptions":[]}')
+            head = commit()
+            with self.assertRaises(ValueError):
+                gate().validate_candidate_policy(repo, head)
+            target.unlink()
+            target.symlink_to(outside)
+            head = commit()
+            with self.assertRaises(ValueError):
+                gate().validate_candidate_policy(repo, head)
+            assert not marker.exists()
+            assert outside.read_text() == '{"version":1,"exceptions":[]}'
+
+    def test_scan_cli_requires_pr_ef7a6d83(
+        self,
+    ) -> None:
+        """PR acceptance validates proposed rules; old historical/tag data keeps
+        trusted rules.
+                ## WRITTEN BY AI ##
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)  # noqa: S603, S607
+
+            def git(*args: Any) -> Any:
+                return subprocess.check_output(  # noqa: S603
+                    [  # noqa: S607
+                        "git",
+                        "-C",
+                        str(repo),
+                        "-c",
+                        "user.name=Unit",
+                        "-c",
+                        "user.email=unit@example.invalid",
+                        *args,
+                    ],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+
+            git("commit", "--allow-empty", "-qm", "initial")
+            ancestor = git("rev-parse", "HEAD")
+            git("checkout", "-qb", "feature")
+            (repo / "feature").write_text("clean candidate")
+            git("add", ".")
+            git("commit", "-qm", "feature")
+            head = git("rev-parse", "HEAD")
+            git("checkout", "-qb", "accepted", ancestor)
+            (repo / "base").write_text("clean accepted")
+            git("add", ".")
+            git("commit", "-qm", "base")
+            base = git("rev-parse", "HEAD")
+            git("merge", "--no-ff", "-qm", "prospective", "feature")
+            merge = git("rev-parse", "HEAD")
+            marker = root / "scanner-called"
+            scanner = root / "scanner"
+            scanner.write_text(
+                "#!/usr/bin/env python3\nfrom pathlib import Path\nPath("
+                + repr(str(marker))
+                + ').write_text("called")\n'
+            )
+            scanner.chmod(0o700)
+            policy = root / "accepted-policy"
+            policy.write_text('{"version":1,"exceptions":[]}')
+            context = root / "context"
+            output = root / "report"
+            command = [
+                "secret_scan.py",
+                "scan",
+                "--repo",
+                str(repo),
+                "--scanner",
+                str(scanner),
+                "--policy",
+                str(policy),
+                "--context",
+                str(context),
+                "--output",
+                str(output),
+            ]
+            context.write_text(
+                json.dumps(
+                    {
+                        "repository": "forlex-ai/unit",
+                        "pr": 1,
+                        "head": head,
+                        "base": base,
+                        "merge": merge,
+                        "kind": "pull_request_target",
+                    }
+                )
+            )
+            with patch.object(sys, "argv", command):
+                assert gate().main() == 1
+            assert not marker.exists()
+            assert json.loads(output.read_text())["result"] == "error"
+            context.write_text(
+                json.dumps(
+                    {
+                        "repository": "forlex-ai/unit",
+                        "pr": None,
+                        "head": ancestor,
+                        "base": None,
+                        "kind": "schedule",
+                    }
+                )
+            )
+            with patch.object(sys, "argv", command):
+                assert gate().main() == 0
+            assert marker.exists()
+            assert json.loads(output.read_text())["result"] == "pass"
+
+    def test_proof_must_bind_immutable_repository_commit_and_path(self) -> None:
+        """An exception cannot cite another source, a branch, or a mutable proof URL.
+        ## WRITTEN BY AI ##
+        """
+        row = exception(finding())
+        row["proof"] = (
+            "https://github.com/forlex-ai/unit/blob/"
+            + row["commit"]
+            + "/"
+            + row["path"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory) / "policy.json"
+            policy.write_text(json.dumps({"version": 1, "exceptions": [row]}))
+            assert gate().read_policy(policy) == [row]
+            for proof in (
+                row["proof"].replace("/unit/", "/other/"),
+                row["proof"].replace(row["commit"], "main"),
+                row["proof"].replace(row["commit"], "b" * 40),
+                row["proof"] + "?raw=1",
+                row["proof"] + "#line",
+                row["proof"].replace("https://", "http://"),
+                row["proof"].replace("/tests/", "/elsewhere/"),
+            ):
+                policy.write_text(
+                    json.dumps({"version": 1, "exceptions": [{**row, "proof": proof}]})
+                )
+                with self.assertRaises(ValueError):
+                    gate().read_policy(policy)
+
+    def test_json_writes_explicitly_label_the_request_body(self) -> None:
+        """Checks API writes carry JSON content type and reads stay credential scoped.
+        ## WRITTEN BY AI ##
+        """
+        module = gate()
+        requests = []
+
+        class Response:
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *args: Any) -> Any:
+                return False
+
+            def read(self) -> Any:
+                return b"{}"
+
+        def send(request: Any, **kwargs: Any) -> Any:
+            _ = kwargs
+            requests.append(request)
+            return Response()
+
+        with (
+            patch.dict(os.environ, {"GH_TOKEN": "inert-unit-auth"}),
+            patch.object(module.urllib.request, "urlopen", send),
+        ):
+            module.github(
+                "forlex-ai/unit", "check-runs", method="POST", body={"name": "unit"}
+            )
+            module.github(
+                "forlex-ai/unit",
+                "check-runs/3",
+                method="PATCH",
+                body={"status": "completed"},
+            )
+            module.github("forlex-ai/unit", "pulls/1")
+        assert all(
+            r.get_header("Content-type") == "application/json" for r in requests[:2]
+        )
+        assert requests[2].data is None
+
+    def test_live_output_bounds_stop_both_streams_and_cleanup_the_process_group(
+        self,
+    ) -> None:
+        """Refuse producers while they write, including a child retaining pipe
+        descriptors.
+                ## WRITTEN BY AI ##
+        """
+        module = gate()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for stream in ["stdout", "stderr"]:
+                output = root / (stream + "-out")
+                errors = root / (stream + "-err")
+                sentinel = root / (stream + "-survived")
+                body = (
+                    "import os,sys,time\nif os.fork()==0:\n time.sleep("
+                    "0.5)\n open(sys.argv[1],'w').write('survived')\n o"
+                    "s._exit(0)\n"
+                )
+                body += (
+                    "stream=sys."
+                    + stream
+                    + ".buffer\nwhile True:\n stream.write(b'x'*4096);stream.flush()\n"
+                )
+                started = time.monotonic()
+                with self.assertRaises(ValueError):
+                    module.run_bounded_scanner(
+                        [sys.executable, "-c", body, str(sentinel)],
+                        os.environ.copy(),
+                        output,
+                        errors,
+                        time.monotonic() + 4,
+                        output_limit=8192,
+                        error_limit=8192,
+                    )
+                assert time.monotonic() - started < 2
+                assert output.stat().st_size <= 8192
+                assert errors.stat().st_size <= 8192
+                time.sleep(0.6)
+                assert not sentinel.exists(), "Scanner child survived refusal"
+
+    def test_rewind_range_rescans_reachable_history(self) -> None:
+        """A backwards branch update cannot claim an empty clean range.
+        ## WRITTEN BY AI ##
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)  # noqa: S603, S607
+            subprocess.run(  # noqa: S603
+                [  # noqa: S607
+                    "git",
+                    "-C",
+                    str(repo),
+                    "-c",
+                    "user.name=Unit",
+                    "-c",
+                    "user.email=unit@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "first",
+                ],
+                check=True,
+            )
+            head = subprocess.check_output(  # noqa: S603
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],  # noqa: S607
+                text=True,  # noqa: S607
+            ).strip()  # fmt: skip
+            subprocess.run(  # noqa: S603
+                [  # noqa: S607
+                    "git",
+                    "-C",
+                    str(repo),
+                    "-c",
+                    "user.name=Unit",
+                    "-c",
+                    "user.email=unit@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "later",
+                ],
+                check=True,
+            )
+            before = subprocess.check_output(  # noqa: S603
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],  # noqa: S607
+                text=True,  # noqa: S607
+            ).strip()  # fmt: skip
+            effective, commits = gate().git_range(repo, head, before)
+            assert effective is None
+            assert commits == [head]
+
+    def test_nonforward_push_with_unrelated_history_scans_the_complete_new_head(
+        self,
+    ) -> None:
+        """A rewritten branch with no merge base retains complete replacement coverage.
+        ## WRITTEN BY AI ##
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)  # noqa: S603, S607
+
+            def commit(message: Any) -> Any:
+                subprocess.run(  # noqa: S603
+                    [  # noqa: S607
+                        "git",
+                        "-C",
+                        str(repo),
+                        "-c",
+                        "user.name=Unit",
+                        "-c",
+                        "user.email=unit@example.invalid",
+                        "commit",
+                        "--allow-empty",
+                        "-qm",
+                        message,
+                    ],
+                    check=True,
+                )
+                return subprocess.check_output(  # noqa: S603
+                    ["git", "-C", str(repo), "rev-parse", "HEAD"],  # noqa: S607
+                    text=True,  # noqa: S607
+                ).strip()  # fmt: skip
+
+            before = commit("old history")
+            subprocess.run(  # noqa: S603
+                ["git", "-C", str(repo), "checkout", "--orphan", "replacement"],  # noqa: S607
+                check=True,
+                capture_output=True,
+            )
+            first = commit("new root")
+            head = commit("new tip")
+            effective, commits = gate().git_range(
+                repo, head, before, full_if_nonforward=True
+            )
+            assert effective is None
+            assert commits == [head, first]
+
+    def test_all_detection_states_block_by_default(self) -> None:
         """Verify all detection states block by default.
         ## WRITTEN BY AI ##
         """
@@ -82,14 +1570,14 @@ class GateTests(unittest.TestCase):
             with self.subTest(verified=row["Verified"]):
                 assert not gate().classify(row, [], "forlex-ai/unit")["suppressed"]
 
-    def test_test_directories_are_scanned(self):
+    def test_test_directories_are_scanned(self) -> None:
         """Verify test directories are scanned.
         ## WRITTEN BY AI ##
         """
         row = finding(path="tests/unit/new_secret.py")
         assert not gate().classify(row, [], "forlex-ai/unit")["suppressed"]
 
-    def test_exception_requires_exact_value_detector_path_commit_and_repo(self):
+    def test_exception_requires_exact_value_detector_path_commit_and_repo(self) -> None:
         """Verify exception requires exact value detector path commit and repo.
         ## WRITTEN BY AI ##
         """
@@ -106,7 +1594,7 @@ class GateTests(unittest.TestCase):
             changed = {**rule, key: value}
             assert not gate().classify(row, [changed], "forlex-ai/unit")["suppressed"]
 
-    def test_verified_detection_cannot_be_suppressed(self):
+    def test_verified_detection_cannot_be_suppressed(self) -> None:
         """Verify verified detection cannot be suppressed.
         ## WRITTEN BY AI ##
         """
@@ -115,7 +1603,7 @@ class GateTests(unittest.TestCase):
             "suppressed"
         ]
 
-    def test_expired_exception_does_not_allow_a_finding(self):
+    def test_expired_exception_does_not_allow_a_finding(self) -> None:
         """Verify expired exception does not allow a finding.
         ## WRITTEN BY AI ##
         """
@@ -123,7 +1611,7 @@ class GateTests(unittest.TestCase):
         rule = {**exception(row), "expires": "2000-01-01"}
         assert not gate().classify(row, [rule], "forlex-ai/unit")["suppressed"]
 
-    def test_report_omits_raw_redacted_error_and_fingerprints(self):
+    def test_report_omits_raw_redacted_error_and_fingerprints(self) -> None:
         """Verify report omits raw redacted error and fingerprints.
         ## WRITTEN BY AI ##
         """
@@ -135,7 +1623,7 @@ class GateTests(unittest.TestCase):
         assert hashlib.sha256(raw.encode()).hexdigest() not in output
         assert "VerificationError" not in output
 
-    def test_secret_in_filename_is_not_published(self):
+    def test_secret_in_filename_is_not_published(self) -> None:
         """Never publish credential bytes carried in Git path metadata.
         ## WRITTEN BY AI ##
         """
@@ -150,7 +1638,7 @@ class GateTests(unittest.TestCase):
             ).hexdigest()
         )
 
-    def test_missing_or_invalid_finding_fields_fail_closed(self):
+    def test_missing_or_invalid_finding_fields_fail_closed(self) -> None:
         """Verify missing or invalid finding fields fail closed.
         ## WRITTEN BY AI ##
         """
@@ -163,14 +1651,14 @@ class GateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gate().classify(row, [], "forlex-ai/unit")
 
-    def test_duplicate_json_keys_are_refused(self):
+    def test_duplicate_json_keys_are_refused(self) -> None:
         """Verify duplicate json keys are refused.
         ## WRITTEN BY AI ##
         """
         with self.assertRaises(ValueError):
             gate().strict_json('{"Raw":"first","Raw":"second"}')
 
-    def test_exception_policy_requires_all_explicit_fields(self):
+    def test_exception_policy_requires_all_explicit_fields(self) -> None:
         """Verify exception policy requires all explicit fields.
         ## WRITTEN BY AI ##
         """
@@ -191,9 +1679,12 @@ class GateTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     gate().read_policy(policy)
 
-    def test_validate_policy_cli_uses_strict_policy_and_redacts_rejections(self):
-        """Validate the candidate policy and redact rejections.
-        ## WRITTEN BY AI ##
+    def test_validate_policy_cli_uses_strict_policy_and_redacts_rejections(
+        self,
+    ) -> None:
+        """Validate the actual candidate policy without publishing rejected field
+        values.
+                ## WRITTEN BY AI ##
         """
         secret = "sensitive-policy-authority"  # noqa: S105
         rule = exception(finding())
@@ -218,16 +1709,18 @@ class GateTests(unittest.TestCase):
                     policy.write_text(body)
                     result = subprocess.run(  # noqa: S603
                         command, capture_output=True, text=True, check=False
-                    )  # noqa: S603  # fmt: skip
+                    )
                     assert result.returncode == 1
                     assert secret not in result.stdout + result.stderr
             policy.write_text(json.dumps({"version": 1, "exceptions": [rule]}))
             assert (
-                subprocess.run(command, capture_output=True, check=False).returncode  # noqa: S603  # fmt: skip
+                subprocess.run(command, capture_output=True, check=False).returncode  # noqa: S603
                 == 0
-            )  # noqa: S603
+            )
 
-    def test_scanner_error_and_invalid_output_fail_and_never_expose_output(self):
+    def test_scanner_error_and_invalid_output_fail_and_never_expose_output(
+        self,
+    ) -> None:
         """Verify scanner error and invalid output fail and never expose output.
         ## WRITTEN BY AI ##
         """
@@ -253,8 +1746,9 @@ class GateTests(unittest.TestCase):
                 check=True,
             )
             head = subprocess.check_output(  # noqa: S603
-                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
-            ).strip()  # noqa: S603, S607  # fmt: skip
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],  # noqa: S607
+                text=True,  # noqa: S607
+            ).strip()  # fmt: skip
             policy = root / "policy.json"
             policy.write_text('{"version":1,"exceptions":[]}')
             scanner = root / "scanner"
@@ -262,9 +1756,9 @@ class GateTests(unittest.TestCase):
                 "print('sensitive-but-synthetic-output'); raise SystemExit(1)",
                 "print('invalid-json')",
                 (
-                    'import sys; print(\'{"level":"error","messa'
-                    'ge":"sensitive-but-synthetic-output"}\', fi'
-                    "le=sys.stderr)"
+                    'import sys; print(\'{"level":"error","message":"s'
+                    "ensitive-but-synthetic-output\"}', file=sys.stder"
+                    "r)"
                 ),
                 "import sys; print('unparsed-sensitive-diagnostic', file=sys.stderr)",
             ):
@@ -277,7 +1771,7 @@ class GateTests(unittest.TestCase):
                 assert "sensitive-but-synthetic-output" not in json.dumps(result)
                 assert list(root.glob("trufflehog-raw*")) == []
 
-    def test_scanner_has_no_inherited_tokens_and_no_live_verification(self):
+    def test_scanner_has_no_inherited_tokens_and_no_live_verification(self) -> None:
         """Verify scanner has no inherited tokens and no live verification.
         ## WRITTEN BY AI ##
         """
@@ -303,17 +1797,18 @@ class GateTests(unittest.TestCase):
                 check=True,
             )
             head = subprocess.check_output(  # noqa: S603
-                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
-            ).strip()  # noqa: S603, S607  # fmt: skip
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],  # noqa: S607
+                text=True,  # noqa: S607
+            ).strip()  # fmt: skip
             policy = root / "policy.json"
             policy.write_text('{"version":1,"exceptions":[]}')
             scanner = root / "scanner"
             scanner.write_text(
-                "#!/usr/bin/env python3\nimport os,sys\nasser"
-                "t not any(k in os.environ for k in ('GH_TO"
-                "KEN','GITHUB_TOKEN','AWS_SECRET_ACCESS_KEY"
-                "'))\nassert '--no-verification' in sys.argv"
-                "\nassert '--no-ignore-tag' in sys.argv\n"
+                "#!/usr/bin/env python3\nimport os,sys\nassert not "
+                "any(k in os.environ for k in ('GH_TOKEN','GITHUB"
+                "_TOKEN','AWS_SECRET_ACCESS_KEY'))\nassert '--no-v"
+                "erification' in sys.argv\nassert '--no-ignore-tag"
+                "' in sys.argv\n"
             )
             scanner.chmod(0o700)
             original = os.environ.get("GH_TOKEN")
@@ -331,7 +1826,9 @@ class GateTests(unittest.TestCase):
                 else:
                     os.environ["GH_TOKEN"] = original
 
-    def test_git_range_uses_merge_base_without_losing_intermediate_commits(self):
+    def test_git_range_uses_merge_base_without_losing_intermediate_commits(
+        self,
+    ) -> None:
         """Verify git range uses merge base without losing intermediate commits.
         ## WRITTEN BY AI ##
         """
@@ -339,7 +1836,7 @@ class GateTests(unittest.TestCase):
             repo = Path(directory)
             subprocess.run(["git", "init", "-q", str(repo)], check=True)  # noqa: S603, S607
 
-            def commit(text):
+            def commit(text: Any) -> Any:
                 (repo / "file").write_text(text)
                 subprocess.run(["git", "-C", str(repo), "add", "file"], check=True)  # noqa: S603, S607
                 subprocess.run(  # noqa: S603
@@ -358,8 +1855,9 @@ class GateTests(unittest.TestCase):
                     check=True,
                 )
                 return subprocess.check_output(  # noqa: S603
-                    ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
-                ).strip()  # noqa: S603, S607  # fmt: skip
+                    ["git", "-C", str(repo), "rev-parse", "HEAD"],  # noqa: S607
+                    text=True,  # noqa: S607
+                ).strip()  # fmt: skip
 
             base = commit("safe")
             introduced = commit("synthetic secret introduced")
@@ -369,14 +1867,14 @@ class GateTests(unittest.TestCase):
             assert introduced in commits
             assert head in commits
 
-    def test_missing_commit_and_shallow_history_are_refused(self):
+    def test_missing_commit_and_shallow_history_are_refused(self) -> None:
         """Verify missing commit and shallow history are refused.
         ## WRITTEN BY AI ##
         """
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):
             gate().git_range(Path(directory), "a" * 40, None)
 
-    def test_scan_timeout_fails_closed(self):
+    def test_scan_timeout_fails_closed(self) -> None:
         """Verify scan timeout fails closed.
         ## WRITTEN BY AI ##
         """
@@ -402,8 +1900,9 @@ class GateTests(unittest.TestCase):
                 check=True,
             )
             head = subprocess.check_output(  # noqa: S603
-                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
-            ).strip()  # noqa: S603, S607  # fmt: skip
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],  # noqa: S607
+                text=True,  # noqa: S607
+            ).strip()  # fmt: skip
             policy = root / "policy.json"
             policy.write_text('{"version":1,"exceptions":[]}')
             scanner = root / "scanner"
@@ -416,12 +1915,12 @@ class GateTests(unittest.TestCase):
                 == "error"
             )
 
-    def test_stale_pr_and_foreign_check_cannot_publish_success(self):
+    def test_stale_pr_and_foreign_check_cannot_publish_success(self) -> None:
         """Refuse changed source and a check owned by another publishing app.
         ## WRITTEN BY AI ##
         """
         module = gate()
-        source: dict[str, Any] = {
+        source = {
             "repository": "forlex-ai/unit",
             "pr": 1,
             "head": "a" * 40,
@@ -438,9 +1937,10 @@ class GateTests(unittest.TestCase):
         }
         calls: list[Any] = []
 
-        def api(repository, suffix, *, method="GET", body=None):
-            _ = repository, suffix, body
-            _ = repository, body  # Preserve the public mock API keyword signature.
+        def api(
+            repository: Any, suffix: Any, *, method: Any = "GET", body: Any = None
+        ) -> Any:
+            _ = body, repository
             calls.append((method, suffix))
             if suffix.startswith("pulls/"):
                 return {
@@ -458,17 +1958,17 @@ class GateTests(unittest.TestCase):
         module.github = api
         with self.assertRaises(ValueError):
             module.publish(source, report)
-        assert not any(method == "PATCH" for method, _ in calls)
+        assert not any((method == "PATCH" for method, _ in calls))
         source["pr"] = None
         with self.assertRaises(ValueError):
             module.publish(source, report)
-        assert not any(method == "PATCH" for method, _ in calls)
+        assert not any((method == "PATCH" for method, _ in calls))
 
-    def test_original_check_identity_mismatch_never_patches(self):
+    def test_original_check_identity_mismatch_never_patches(self) -> None:
         """Reject checks with a different original identity or publishing app.
         ## WRITTEN BY AI ##
         """
-        source: dict[str, Any] = {
+        source = {
             "repository": "forlex-ai/unit",
             "pr": 1,
             "head": "a" * 40,
@@ -500,16 +2000,16 @@ class GateTests(unittest.TestCase):
                 calls: list[Any] = []
 
                 def api(
-                    repository,
-                    suffix,
+                    repository: Any,
+                    suffix: Any,
                     *,
-                    method="GET",
-                    body=None,
-                    calls=calls,
-                    mismatched=mismatched,
-                    module=module,
-                ):
-                    _ = repository, suffix, body
+                    method: Any = "GET",
+                    body: Any = None,
+                    calls: Any = calls,
+                    mismatched: Any = mismatched,
+                    module: Any = module,
+                ) -> Any:
+                    _ = body, repository
                     calls.append((method, suffix))
                     if suffix.startswith("pulls/"):
                         raise module.SecretScanRefusalError("private current PR error")
@@ -518,15 +2018,17 @@ class GateTests(unittest.TestCase):
                 module.github = api
                 with self.assertRaises(module.SecretScanRefusalError):
                     module.publish(source, report)
-                assert not any(method == "PATCH" for method, _ in calls)
+                assert not any((method == "PATCH" for method, _ in calls))
 
-    def test_changed_or_unreadable_pr_finishes_original_owned_check_as_failure(self):
-        """Close the original check safely when current PR evidence changes or
-        is unavailable.
-        ## WRITTEN BY AI ##
+    def test_changed_or_unreadable_pr_finishes_original_owned_check_as_failure(
+        self,
+    ) -> None:
+        """Close the original check safely when current PR evidence changes or is
+        unavailable.
+                ## WRITTEN BY AI ##
         """
         secret = "sensitive-current-pr-read-error"  # noqa: S105
-        source: dict[str, Any] = {
+        source = {
             "repository": "forlex-ai/unit",
             "pr": 1,
             "head": "a" * 40,
@@ -553,17 +2055,17 @@ class GateTests(unittest.TestCase):
                 }
 
                 def api(
-                    repository,
-                    suffix,
+                    repository: Any,
+                    suffix: Any,
                     *,
-                    method="GET",
-                    body=None,
-                    calls=calls,
-                    changed=changed,
-                    module=module,
-                    owned=owned,
-                ):
-                    _ = repository, suffix, body
+                    method: Any = "GET",
+                    body: Any = None,
+                    calls: Any = calls,
+                    changed: Any = changed,
+                    module: Any = module,
+                    owned: Any = owned,
+                ) -> Any:
+                    _ = repository
                     calls.append((method, suffix, body))
                     if suffix.startswith("pulls/"):
                         if changed == "unreadable":
@@ -595,12 +2097,14 @@ class GateTests(unittest.TestCase):
                 assert patches[0][1]["status"] == "completed"
                 assert secret not in json.dumps(result)
 
-    def test_check_read_and_patch_errors_refuse_without_exposing_provider_text(self):
+    def test_check_read_and_patch_errors_refuse_without_exposing_provider_text(
+        self,
+    ) -> None:
         """Unavailable check identity or completion must not claim a terminal result.
         ## WRITTEN BY AI ##
         """
         secret = "sensitive-check-provider-error"  # noqa: S105
-        source: dict[str, Any] = {
+        source = {
             "repository": "forlex-ai/unit",
             "pr": 1,
             "head": "a" * 40,
@@ -621,16 +2125,16 @@ class GateTests(unittest.TestCase):
                 calls: list[Any] = []
 
                 def api(
-                    repository,
-                    suffix,
+                    repository: Any,
+                    suffix: Any,
                     *,
-                    method="GET",
-                    body=None,
-                    calls=calls,
-                    failed=failed,
-                    module=module,
-                ):
-                    _ = repository, suffix, body
+                    method: Any = "GET",
+                    body: Any = None,
+                    calls: Any = calls,
+                    failed: Any = failed,
+                    module: Any = module,
+                ) -> Any:
+                    _ = repository
                     calls.append((method, suffix, body))
                     if suffix.startswith("pulls/"):
                         raise module.SecretScanRefusalError(secret)
@@ -648,15 +2152,18 @@ class GateTests(unittest.TestCase):
                     module.publish(source, report)
                 assert secret not in str(refusal.exception)
                 patches = [body for method, _, body in calls if method == "PATCH"]
-                assert len(patches) == (1 if failed == "patch" else 0)
+                assert len(patches) == (2 if failed == "patch" else 0)
                 assert all(body["conclusion"] == "failure" for body in patches)
+                for index, (method, suffix, _body) in enumerate(calls):
+                    if method == "PATCH":
+                        assert calls[index - 1] == ("GET", suffix, None)
 
-    def test_patch_response_must_confirm_original_owned_terminal_result(self):
-        """Never infer successful completion from an incomplete or
-        contradictory API response.
-        ## WRITTEN BY AI ##
+    def test_patch_response_must_confirm_original_owned_terminal_result(self) -> None:
+        """Never infer successful completion from an incomplete or contradictory API
+        response.
+                ## WRITTEN BY AI ##
         """
-        source: dict[str, Any] = {
+        source = {
             "repository": "forlex-ai/unit",
             "pr": None,
             "head": "a" * 40,
@@ -674,7 +2181,7 @@ class GateTests(unittest.TestCase):
         owned = {
             "id": 3,
             "head_sha": source["head"],
-            "name": "TruffleHog secret scan",
+            "name": "TruffleHog history scan",
             "app": {"id": 15368},
         }
         for response in (
@@ -698,20 +2205,20 @@ class GateTests(unittest.TestCase):
             with self.subTest(response=response):
                 module = gate()
                 module.github = (
-                    lambda *_args, method="GET", response=response, **_kwargs: (
-                        response if method == "PATCH" else owned
+                    lambda *args, method="GET", response=response, **kwargs: (
+                        (args, kwargs, (response if method == "PATCH" else owned))[-1]
                     )
                 )
                 with self.assertRaises(module.SecretScanRefusalError):
                     module.publish(source, report)
 
-    def test_failed_report_counts_are_redacted_in_published_failure(self):
+    def test_failed_report_counts_are_redacted_in_published_failure(self) -> None:
         """Malformed counts cannot carry secret bytes into a terminal summary.
         ## WRITTEN BY AI ##
         """
         module = gate()
         secret = "sensitive-report-count"  # noqa: S105
-        source: dict[str, Any] = {
+        source = {
             "repository": "forlex-ai/unit",
             "pr": None,
             "head": "a" * 40,
@@ -721,13 +2228,11 @@ class GateTests(unittest.TestCase):
         owned = {
             "id": 3,
             "head_sha": source["head"],
-            "name": "TruffleHog secret scan",
+            "name": "TruffleHog history scan",
             "app": {"id": 15368},
         }
-        module.github = (
-            lambda *_args, method="GET", body=None: {**owned, **body}
-            if method == "PATCH"
-            else owned
+        module.github = lambda *args, method="GET", body=None: (
+            (args, ({**owned, **body} if method == "PATCH" else owned))[-1]
         )
         result = module.publish(
             source,
@@ -741,12 +2246,12 @@ class GateTests(unittest.TestCase):
         assert result["conclusion"] == "failure"
         assert secret not in json.dumps(result)
 
-    def test_missing_and_inconsistent_reports_publish_failure(self):
+    def test_missing_and_inconsistent_reports_publish_failure(self) -> None:
         """Do not accept a declared pass with failed or incomplete scan counts.
         ## WRITTEN BY AI ##
         """
         module = gate()
-        source: dict[str, Any] = {
+        source = {
             "repository": "forlex-ai/unit",
             "pr": None,
             "head": "a" * 40,
@@ -754,13 +2259,14 @@ class GateTests(unittest.TestCase):
             "check_id": 3,
         }
 
-        def api(repository, suffix, *, method="GET", body=None):
-            _ = repository, suffix, body
-            _ = repository, body  # Preserve the public mock API keyword signature.
+        def api(
+            repository: Any, suffix: Any, *, method: Any = "GET", body: Any = None
+        ) -> Any:
+            _ = repository, suffix
             owned = {
                 "id": 3,
                 "head_sha": source["head"],
-                "name": "TruffleHog secret scan",
+                "name": "TruffleHog history scan",
                 "app": {"id": 15368},
             }
             if method == "PATCH":
@@ -791,12 +2297,12 @@ class GateTests(unittest.TestCase):
 
     def test_publish_cli_unreadable_or_nonobject_report_finishes_owned_check_as_failure(
         self,
-    ):
+    ) -> None:
         """Damaged report artifacts still terminate only the verified trusted check.
         ## WRITTEN BY AI ##
         """
         secret = "sensitive-report-artifact"  # noqa: S105
-        source: dict[str, Any] = {
+        source = {
             "repository": "forlex-ai/unit",
             "pr": 1,
             "head": "a" * 40,
@@ -838,9 +2344,14 @@ class GateTests(unittest.TestCase):
                         report.mkdir()
 
                     def api(
-                        repository, suffix, *, method="GET", body=None, calls=calls
-                    ):
-                        _ = repository, suffix, body
+                        repository: Any,
+                        suffix: Any,
+                        *,
+                        method: Any = "GET",
+                        body: Any = None,
+                        calls: Any = calls,
+                    ) -> Any:
+                        _ = repository
                         calls.append((method, suffix, body))
                         if suffix.startswith("pulls/"):
                             return {
@@ -877,7 +2388,7 @@ class GateTests(unittest.TestCase):
                         not in stdout.getvalue() + stderr.getvalue() + json.dumps(calls)
                     )
 
-    def test_publish_cli_unreadable_context_cannot_choose_a_check(self):
+    def test_publish_cli_unreadable_context_cannot_choose_a_check(self) -> None:
         """Refuse before API access when trusted check identity cannot be read.
         ## WRITTEN BY AI ##
         """
@@ -893,9 +2404,11 @@ class GateTests(unittest.TestCase):
             ):
                 with self.subTest(name=name):
                     module = gate()
-                    module.github = lambda *_args, **_kwargs: self.fail(
-                        "Unverifiable context reached the API"
-                    )
+                    module.github = lambda *args, **kwargs: (
+                        args,
+                        kwargs,
+                        (self.fail("Unverifiable context reached the API")),
+                    )[-1]
                     context = root / name
                     if data is not None:
                         context.write_text(data)
@@ -915,14 +2428,16 @@ class GateTests(unittest.TestCase):
                         assert module.main() == 1
                     assert secret not in stdout.getvalue() + stderr.getvalue()
 
-    def test_unsupported_events_cannot_create_checks(self):
+    def test_unsupported_events_cannot_create_checks(self) -> None:
         """Allow only the explicitly supported trusted workflow events.
         ## WRITTEN BY AI ##
         """
         module = gate()
-        module.github = lambda *_args, **_kwargs: self.fail(
-            "An unsupported event reached the GitHub API"
-        )
+        module.github = lambda *args, **kwargs: (
+            args,
+            kwargs,
+            (self.fail("An unsupported event reached the GitHub API")),
+        )[-1]
         with self.assertRaises(ValueError):
             module.context(
                 {"repository": {"full_name": "forlex-ai/unit"}},
@@ -930,12 +2445,12 @@ class GateTests(unittest.TestCase):
                 "forlex-ai/unit",
             )
 
-    def test_tag_push_uses_native_commit_head_and_full_history_scope(self):
+    def test_tag_push_uses_native_commit_head_and_full_history_scope(self) -> None:
         """An updated annotated tag's prior object cannot limit metadata admission.
         ## WRITTEN BY AI ##
         """
         module = gate()
-        module.github = lambda *_args, **_kwargs: {"id": 3}
+        module.github = lambda *args, **kwargs: (args, kwargs, ({"id": 3}))[-1]
         event = {
             "repository": {"full_name": "forlex-ai/unit"},
             "ref": "refs/tags/release",
@@ -954,13 +2469,13 @@ class GateTests(unittest.TestCase):
             assert source["base"] == "b" * 40
             assert "tag_object" not in source
 
-    def test_tag_context_cli_outputs_validated_exact_pushed_object(self):
-        """The inert checkout must receive the immutable event object, never a
-        mutable ref.
-        ## WRITTEN BY AI ##
+    def test_tag_context_cli_outputs_validated_exact_pushed_object(self) -> None:
+        """The inert checkout must receive the immutable event object, never a mutable
+        ref.
+                ## WRITTEN BY AI ##
         """
         module = gate()
-        module.github = lambda *_args, **_kwargs: {"id": 3}
+        module.github = lambda *args, **kwargs: (args, kwargs, ({"id": 3}))[-1]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             event = root / "event.json"
@@ -998,12 +2513,12 @@ class GateTests(unittest.TestCase):
             assert "tag_object=" + "c" * 40 + "\n" in gha_output.read_text()
             assert "refs/tags/release" not in gha_output.read_text()
 
-    def test_tag_report_must_bind_exact_pushed_object_and_ref_digest(self):
+    def test_tag_report_must_bind_exact_pushed_object_and_ref_digest(self) -> None:
         """A commit-only pass cannot stand in for the pushed tag object's scan.
         ## WRITTEN BY AI ##
         """
         module = gate()
-        source: dict[str, Any] = {
+        source = {
             "repository": "forlex-ai/unit",
             "pr": None,
             "head": "a" * 40,
@@ -1025,19 +2540,19 @@ class GateTests(unittest.TestCase):
         owned = {
             "id": 3,
             "head_sha": source["head"],
-            "name": "TruffleHog secret scan",
+            "name": "TruffleHog history scan",
             "app": {"id": 15368},
         }
-        module.github = (
-            lambda *_args, method="GET", body=None: {**owned, **body}
-            if method == "PATCH"
-            else owned
+        module.github = lambda *args, method="GET", body=None: (
+            (args, ({**owned, **body} if method == "PATCH" else owned))[-1]
         )
         assert module.publish(source, report)["conclusion"] == "failure"
         qualified = {
             **report,
             "tag_object": source["tag_object"],
-            "tag_ref_digest": hashlib.sha256(source["tag_ref"].encode()).hexdigest(),
+            ("tag_ref_digest"): hashlib.sha256(
+                cast("str", source[("tag_ref")]).encode()
+            ).hexdigest(),
         }
         assert module.publish(source, qualified)["conclusion"] == "success"
 
@@ -1049,7 +2564,54 @@ class GateTests(unittest.TestCase):
 class NativeScannerTests(unittest.TestCase):
     """Exercise real offline detection in disposable Git history."""
 
-    def git(self, repo, *args):
+    def test_native_missing_old_push_tip_still_detects_reachable_canary(self) -> None:
+        """Real offline detection covers new reachable history when the orphaned old
+        tip is absent.
+                ## WRITTEN BY AI ##
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q")
+            value = self.canary()
+            (repo / "fixture.txt").write_text("token=" + value + "\n")
+            introduced = self.commit(repo)
+            (repo / "fixture.txt").unlink()
+            head = self.commit(repo)
+            policy = root / "policy.json"
+            policy.write_text('{"version":1,"exceptions":[]}')
+            module = gate()
+            report = module.scan(
+                repo,
+                head,
+                "f" * 40,
+                Path(os.environ["TRUFFLEHOG_BINARY"]),
+                policy,
+                "forlex-ai/unit",
+                60,
+                full_if_nonforward=True,
+            )
+            assert report["result"] == "fail", json.dumps(report)
+            assert report["effective_base"] is None
+            assert report["commit_count"] == 2
+            assert report["blocked"] > 0
+            assert any(row["commit"] == introduced for row in report["findings"])
+            assert value not in json.dumps(report)
+            assert (
+                module.scan(
+                    repo,
+                    head,
+                    "f" * 40,
+                    Path(os.environ["TRUFFLEHOG_BINARY"]),
+                    policy,
+                    "forlex-ai/unit",
+                    60,
+                )["result"]
+                == "error"
+            )
+
+    def git(self, repo: Any, *args: Any) -> Any:
         """Operate on one inert disposable fixture repository."""
         return subprocess.check_output(  # noqa: S603
             [  # noqa: S607
@@ -1061,12 +2623,12 @@ class NativeScannerTests(unittest.TestCase):
                 "-c",
                 "user.email=unit@example.invalid",
                 *args,
-            ],  # noqa: S607
+            ],
             text=True,
             stderr=subprocess.DEVNULL,
-        ).strip()  # fmt: skip
+        ).strip()
 
-    def canary(self, marker=""):
+    def canary(self, marker: Any = "") -> Any:
         """Create an unregistered valid-format detector canary."""
         return (
             "ghp_"
@@ -1077,16 +2639,19 @@ class NativeScannerTests(unittest.TestCase):
             )
         )
 
-    def commit(self, repo, message="fixture"):
+    def commit(self, repo: Any, message: Any = "fixture") -> Any:
         """Record fixture data without executing repository hooks."""
         self.git(repo, "add", ".")
         self.git(repo, "commit", "-qm", message)
         return self.git(repo, "rev-parse", "HEAD")
 
-    def scan(self, root, repo, head, base=None, exceptions=None):
+    def scan(
+        self, root: Any, repo: Any, head: Any, base: Any = None, exceptions: Any = None
+    ) -> Any:
         """Run the pinned offline executable against actual fixture history."""
         policy = root / "policy.json"
-        policy.write_text(json.dumps({"version": 1, "exceptions": exceptions or []}))
+        rules = [{**row, "proof": proof_url(row)} for row in exceptions or []]
+        policy.write_text(json.dumps({"version": 1, "exceptions": rules}))
         return gate().scan(
             repo,
             head,
@@ -1097,9 +2662,200 @@ class NativeScannerTests(unittest.TestCase):
             60,
         )
 
+    def test_same_canary_in_distinct_blobs_retains_the_unexcepted_occurrence(
+        self,
+    ) -> None:
+        """Native value deduplication cannot hide another distinct exact source.
+        ## WRITTEN BY AI ##
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q")
+            raw = self.canary()
+            (repo / "first.txt").write_text("TOKEN = " + repr(raw) + "\n")
+            first = self.commit(repo)
+            (repo / "second.txt").write_text(
+                "different blob context\nTOKEN = " + repr(raw) + "\n"
+            )
+            head = self.commit(repo)
+            rule = {
+                **exception(finding(raw, path="first.txt")),
+                "commit": first,
+                "detector": "Github",
+            }
+            result = self.scan(root, repo, head, exceptions=[rule])
+            assert result["result"] == "fail", json.dumps(result)
+            assert result["suppressed"] > 0
+            assert result["blocked"] > 0
+            assert raw not in json.dumps(result)
+            assert any(
+                r["commit"] == head
+                and r["path_digest"] == hashlib.sha256(b"second.txt").hexdigest()
+                and (not r["suppressed"])
+                for r in result["findings"]
+            )
+
+    def test_unchanged_second_parent_fixture_is_not_rebound_to_merge_commit(
+        self,
+    ) -> None:
+        """Merging the accepted base preserves its original exact fixture authority.
+        ## WRITTEN BY AI ##
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q")
+            (repo / "README").write_text("clean\n")
+            ancestor = self.commit(repo)
+            self.git(repo, "checkout", "-qb", "feature")
+            (repo / "feature.txt").write_text("clean feature\n")
+            self.commit(repo)
+            self.git(repo, "checkout", "-qb", "accepted", ancestor)
+            raw = self.canary()
+            (repo / "fixture.txt").write_text("TOKEN = " + repr(raw) + "\n")
+            base = self.commit(repo)
+            self.git(repo, "checkout", "-q", "feature")
+            self.git(repo, "merge", "--no-ff", "-qm", "merge accepted base", "accepted")
+            head = self.git(repo, "rev-parse", "HEAD")
+            rule = {
+                **exception(finding(raw, path="fixture.txt")),
+                "commit": base,
+                "detector": "Github",
+            }
+            result = self.scan(root, repo, head, base, [rule])
+            assert result["result"] == "pass", json.dumps(result)
+            payloads = root / "payloads"
+            payloads.mkdir()
+            _, commits = gate().git_range(repo, head, base)
+            index = gate().materialize(repo, commits, payloads, time.monotonic() + 60)
+            assert not any(
+                s["file"] == "fixture.txt"
+                for sources in index.values()
+                for s in sources
+            )
+
+    def test_native_rewind_still_detects_reachable_canary(self) -> None:
+        """A later clean commit cannot make an earlier unsafe head an empty rewind.
+        ## WRITTEN BY AI ##
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q")
+            raw = self.canary()
+            (repo / "fixture.txt").write_text("TOKEN = " + repr(raw) + "\n")
+            head = self.commit(repo)
+            (repo / "fixture.txt").write_text("clean after removal\n")
+            before = self.commit(repo)
+            result = self.scan(root, repo, head, before)
+            assert result["result"] == "fail", json.dumps(result)
+            assert result["blocked"] > 0
+
+    def test_prospective_merge_result_is_scanned_and_wrong_parent_binding_refuses(
+        self,
+    ) -> None:
+        """A source found only in the validated merge result blocks pre-acceptance.
+        ## WRITTEN BY AI ##
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q")
+            (repo / "README").write_text("clean common source\n")
+            ancestor = self.commit(repo)
+            self.git(repo, "checkout", "-qb", "feature")
+            (repo / "feature").write_text("clean candidate\n")
+            head = self.commit(repo)
+            self.git(repo, "checkout", "-qb", "accepted", ancestor)
+            (repo / "base").write_text("clean accepted\n")
+            base = self.commit(repo)
+            self.git(repo, "merge", "--no-ff", "--no-commit", "feature")
+            raw = self.canary()
+            (repo / "merged").write_text("TOKEN = " + repr(raw) + "\n")
+            merge = self.commit(repo)
+            policy = root / "policy"
+            policy.write_text('{"version":1,"exceptions":[]}')
+            module = gate()
+            scanner = Path(os.environ["TRUFFLEHOG_BINARY"])
+            assert (
+                module.scan(repo, head, base, scanner, policy, "forlex-ai/unit", 60)[
+                    "result"
+                ]
+                == "pass"
+            )
+            result = module.scan(
+                repo, head, base, scanner, policy, "forlex-ai/unit", 60, merge=merge
+            )
+            assert result["result"] == "fail", json.dumps(result)
+            assert result["merge"] == merge
+            assert any(r["commit"] == merge for r in result["findings"])
+            assert raw not in json.dumps(result)
+            assert (
+                module.scan(
+                    repo,
+                    head,
+                    ancestor,
+                    scanner,
+                    policy,
+                    "forlex-ai/unit",
+                    60,
+                    merge=merge,
+                )["result"]
+                == "error"
+            )
+
+    def test_valid_candidate_exception_is_inert_and_cannot_waive_accepted_policy(
+        self,
+    ) -> None:
+        """Even schema-valid candidate fixture rules cannot suppress a trusted scan.
+        ## WRITTEN BY AI ##
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q")
+            raw = self.canary()
+            (repo / "fixture.txt").write_text("TOKEN = " + repr(raw) + "\n")
+            first = self.commit(repo)
+            rule = {
+                **exception(finding(raw, path="fixture.txt")),
+                "commit": first,
+                "detector": "Github",
+            }
+            rule["proof"] = proof_url(rule)
+            path = repo / ".forlex/security"
+            path.mkdir(parents=True)
+            (path / "exceptions.json").write_text(
+                json.dumps({"version": 1, "exceptions": [rule]})
+            )
+            head = self.commit(repo)
+            policy = root / "accepted-policy"
+            policy.write_text('{"version":1,"exceptions":[]}')
+            result = gate().scan(
+                repo,
+                head,
+                None,
+                Path(os.environ["TRUFFLEHOG_BINARY"]),
+                policy,
+                "forlex-ai/unit",
+                60,
+                candidate_policy=".forlex/security/exceptions.json",
+            )
+            assert result["result"] == "fail", json.dumps(result)
+            assert result["candidate_policy_validated"]
+            assert result["candidate_policy_source"] == head
+            assert result["blocked"] > 0
+            assert result["suppressed"] == 0
+
     def test_annotated_tag_message_is_scanned_only_in_full_history_and_never_excepted(
         self,
-    ):
+    ) -> None:
         """Current tag metadata blocks independently of commit-range fixture policy.
         ## WRITTEN BY AI ##
         """
@@ -1150,7 +2906,7 @@ class NativeScannerTests(unittest.TestCase):
 
     def test_nested_annotated_tag_metadata_remains_scanned_after_inner_ref_is_deleted(
         self,
-    ):
+    ) -> None:
         """Scan every tag object reachable through a current annotated tag ref.
         ## WRITTEN BY AI ##
         """
@@ -1190,7 +2946,7 @@ class NativeScannerTests(unittest.TestCase):
 
     def test_pushed_tag_object_remains_bound_after_ref_moves_and_missing_object_refuses(
         self,
-    ):
+    ) -> None:
         """Current clean metadata cannot replace an immutable pushed tag object.
         ## WRITTEN BY AI ##
         """
@@ -1209,7 +2965,7 @@ class NativeScannerTests(unittest.TestCase):
             policy.write_text('{"version":1,"exceptions":[]}')
             assert self.scan(root, repo, head)["result"] == "pass"
 
-            def pushed_scan():
+            def pushed_scan() -> Any:
                 return gate().scan(
                     repo,
                     head,
@@ -1234,7 +2990,9 @@ class NativeScannerTests(unittest.TestCase):
             (repo / ".git" / "objects" / pushed[:2] / pushed[2:]).unlink()
             assert pushed_scan()["result"] == "error"
 
-    def test_lightweight_tag_push_is_commit_bound_and_invalid_tag_scope_refuses(self):
+    def test_lightweight_tag_push_is_commit_bound_and_invalid_tag_scope_refuses(
+        self,
+    ) -> None:
         """Lightweight pushes scan commits without inventing annotated metadata.
         ## WRITTEN BY AI ##
         """
@@ -1309,7 +3067,7 @@ class NativeScannerTests(unittest.TestCase):
             )
             assert delta["result"] == "error"
 
-    def test_merge_only_resolution_is_scanned(self):
+    def test_merge_only_resolution_is_scanned(self) -> None:
         """Detect a secret present only in the resolved merge commit.
         ## WRITTEN BY AI ##
         """
@@ -1353,7 +3111,7 @@ class NativeScannerTests(unittest.TestCase):
                 assert report["result"] == "fail", json.dumps(report)
                 assert raw not in json.dumps(report)
 
-    def test_modified_rename_is_scanned_in_full_history_and_pr_range(self):
+    def test_modified_rename_is_scanned_in_full_history_and_pr_range(self) -> None:
         """Cover a high-similarity rename that native Git history skipped.
         ## WRITTEN BY AI ##
         """
@@ -1375,7 +3133,7 @@ class NativeScannerTests(unittest.TestCase):
                 assert report["result"] == "fail", json.dumps(report)
                 assert raw not in json.dumps(report)
 
-    def test_wordlist_and_filename_do_not_waive_or_expose_canaries(self):
+    def test_wordlist_and_filename_do_not_waive_or_expose_canaries(self) -> None:
         """Keep native filtered findings and hide arbitrary source filenames.
         ## WRITTEN BY AI ##
         """
@@ -1391,7 +3149,9 @@ class NativeScannerTests(unittest.TestCase):
             assert report["result"] == "fail", json.dumps(report)
             assert raw not in json.dumps(report)
 
-    def test_commit_metadata_and_symlink_targets_are_scanned_as_inert_data(self):
+    def test_commit_metadata_and_symlink_targets_are_scanned_as_inert_data(
+        self,
+    ) -> None:
         """Preserve metadata coverage and never follow candidate symlinks.
         ## WRITTEN BY AI ##
         """
@@ -1408,7 +3168,9 @@ class NativeScannerTests(unittest.TestCase):
             assert report["blocked"] >= 2
             assert raw not in json.dumps(report)
 
-    def test_exact_fixture_exception_does_not_waive_new_commit_associations(self):
+    def test_exact_fixture_exception_does_not_waive_new_commit_associations(
+        self,
+    ) -> None:
         """A subsequent file edit must qualify its own immutable exception.
         ## WRITTEN BY AI ##
         """
@@ -1431,7 +3193,9 @@ class NativeScannerTests(unittest.TestCase):
             assert report["result"] == "fail", json.dumps(report)
             assert report["suppressed"] > 0
 
-    def test_real_scanner_catches_introduced_then_deleted_test_directory_canary(self):
+    def test_real_scanner_catches_introduced_then_deleted_test_directory_canary(
+        self,
+    ) -> None:
         """Verify real scanner catches introduced then deleted test directory canary.
         ## WRITTEN BY AI ##
         """
@@ -1441,7 +3205,7 @@ class NativeScannerTests(unittest.TestCase):
             repo.mkdir()
             subprocess.run(["git", "init", "-q", str(repo)], check=True)  # noqa: S603, S607
 
-            def commit():
+            def commit() -> Any:
                 subprocess.run(["git", "-C", str(repo), "add", "."], check=True)  # noqa: S603, S607
                 subprocess.run(  # noqa: S603
                     [  # noqa: S607
@@ -1459,8 +3223,9 @@ class NativeScannerTests(unittest.TestCase):
                     check=True,
                 )
                 return subprocess.check_output(  # noqa: S603
-                    ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
-                ).strip()  # noqa: S603, S607  # fmt: skip
+                    ["git", "-C", str(repo), "rev-parse", "HEAD"],  # noqa: S607
+                    text=True,  # noqa: S607
+                ).strip()  # fmt: skip
 
             (repo / "README").write_text("safe source")
             base = commit()
@@ -1495,7 +3260,7 @@ class NativeScannerTests(unittest.TestCase):
             )
             assert value not in json.dumps(report)
 
-    def test_real_scanner_clean_full_history_passes(self):
+    def test_real_scanner_clean_full_history_passes(self) -> None:
         """Verify real scanner clean full history passes.
         ## WRITTEN BY AI ##
         """
@@ -1522,8 +3287,9 @@ class NativeScannerTests(unittest.TestCase):
                 check=True,
             )
             head = subprocess.check_output(  # noqa: S603
-                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
-            ).strip()  # noqa: S603, S607  # fmt: skip
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],  # noqa: S607
+                text=True,  # noqa: S607
+            ).strip()  # fmt: skip
             policy = root / "policy.json"
             policy.write_text('{"version":1,"exceptions":[]}')
             report = gate().scan(
