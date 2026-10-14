@@ -50,6 +50,22 @@ ACTIONS_CHECK_APP_ID = 15368
 OUTPUT_LIMIT = 256 * 1024 * 1024
 DIAGNOSTIC_LIMIT = 16 * 1024 * 1024
 POLICY_LIMIT = 1024 * 1024
+SOURCE_ASSOCIATION_BOUND = 1_000_000
+RAW_DIFF_FIELDS = 5
+TAG_REFERENCE_FIELDS = 2
+TAG_NESTING_BOUND = 64
+OBJECT_HEADER_FIELDS = 3
+REDACTED_FINDING_BOUND = 100
+FRAME_PREFIX_BYTES = 4
+SKIPPABLE_FRAME_MIN = 0x50
+SKIPPABLE_FRAME_MAX = 0x5F
+ZLIB_HEADER_BYTES = 2
+DEFLATE_METHOD = 8
+MAX_WINDOW_LOG = 7
+ARCHIVE_PREFIX_BYTES = 512
+OCTAL_ASCII_MIN = 48
+OCTAL_ASCII_MAX = 55
+SIGNED_BYTE_THRESHOLD = 128
 
 
 class SecretScanRefusalError(ValueError):
@@ -319,7 +335,7 @@ def materialize(  # noqa: C901, PLR0912, PLR0915
         An exact generated-path index retaining every immutable source association.
 
     Raises:
-        SecretScanRefusal: Missing objects, unsupported modes, or resource bounds.
+        SecretScanRefusalError: Missing objects, unsupported modes, or resource bounds.
     """
     environment = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -349,7 +365,7 @@ def materialize(  # noqa: C901, PLR0912, PLR0915
     def add(key: Any, source: Any) -> Any:
         nonlocal associations
         associations += 1
-        if associations > SOURCE_ASSOCIATION_LIMIT:
+        if associations > SOURCE_ASSOCIATION_BOUND:
             raise SecretScanRefusalError("source association limit exceeded")
         if key not in payloads:
             path = directory / ("payload-" + str(len(payloads)))
@@ -384,7 +400,7 @@ def materialize(  # noqa: C901, PLR0912, PLR0915
                 entry, raw_path = changes[offset], changes[offset + 1]
                 fields = entry.split()
                 if (
-                    len(fields) != GIT_CHANGE_FIELD_COUNT
+                    len(fields) != RAW_DIFF_FIELDS
                     or not fields[0].startswith(b":")
                     or not raw_path
                 ):
@@ -398,11 +414,9 @@ def materialize(  # noqa: C901, PLR0912, PLR0915
                     raise SecretScanRefusalError("unsupported changed-object identity")
                 changed.add((raw_path, mode, object_id))
             novel = changed if novel is None else novel & changed
-        for raw_path, mode, object_id in sorted(
-            cast("set[tuple[Any, Any, Any]]", novel)
-        ):
-            source_path = os.fsdecode(raw_path)
-            source = {"commit": commit, "file": source_path, "kind": "file_content"}
+        for raw_path, mode, object_id in sorted(cast("Any", novel)):
+            path: Any = os.fsdecode(raw_path)
+            source = {"commit": commit, "file": path, "kind": "file_content"}
             add(("filename", raw_path), {**source, "kind": "filename"})
             if mode == b"160000":
                 # Child content belongs to its own repository's independently accepted
@@ -422,7 +436,7 @@ def materialize(  # noqa: C901, PLR0912, PLR0915
         ).splitlines():
             fields = row.decode("ascii").split()
             if (
-                len(fields) != TAG_REF_FIELD_COUNT
+                len(fields) != TAG_REFERENCE_FIELDS
                 or not SHA.fullmatch(fields[0])
                 or fields[1] not in {"tag", "commit", "tree", "blob"}
             ):
@@ -443,12 +457,12 @@ def materialize(  # noqa: C901, PLR0912, PLR0915
             references.append(
                 (tag_object, git("cat-file", "-t", tag_object).strip().decode("ascii"))
             )
-        for initial_object, initial_kind in references:
-            object_id, kind = initial_object, initial_kind
+        for reference_id, reference_kind in references:
+            object_id, kind = reference_id, reference_kind
             depth = 0
             while kind == "tag" and object_id not in visited:
                 depth += 1
-                if depth > TAG_NESTING_LIMIT:
+                if depth > TAG_NESTING_BOUND:
                     raise SecretScanRefusalError("tag nesting limit exceeded")
                 visited.add(object_id)
                 add(
@@ -463,7 +477,7 @@ def materialize(  # noqa: C901, PLR0912, PLR0915
                     git("cat-file", "tag", object_id).partition(b"\n\n")[0].splitlines()
                 )
                 if (
-                    len(headers) < TAG_HEADER_MINIMUM
+                    len(headers) < OBJECT_HEADER_FIELDS
                     or not headers[0].startswith(b"object ")
                     or not headers[1].startswith(b"type ")
                 ):
@@ -498,11 +512,11 @@ def materialize(  # noqa: C901, PLR0912, PLR0915
             env=environment,
         )
         try:
-            for (kind, object_id), (path, _) in objects:
-                header = cast("BinaryIO", process.stdout).readline(200)
+            for (kind, object_id), (path, sources) in objects:
+                header = cast("Any", process.stdout).readline(200)
                 fields = header.rstrip(b"\n").split()
                 if (
-                    len(fields) != GIT_OBJECT_HEADER_FIELD_COUNT
+                    len(fields) != OBJECT_HEADER_FIELDS
                     or fields[:2] != [object_id.encode("ascii"), kind.encode("ascii")]
                     or not fields[2].isdigit()
                 ):
@@ -514,22 +528,35 @@ def materialize(  # noqa: C901, PLR0912, PLR0915
                         "source materialization limit exceeded"
                     )
                 with path.open("wb") as output:
-                    Path(path).chmod(0o600)
+                    path.chmod(0o600)
                     remaining = size
+                    if kind == "blob":
+                        if time.monotonic() >= deadline:
+                            raise SecretScanRefusalError("source extraction timeout")
+                        prefix = cast("Any", process.stdout).read(min(512, remaining))
+                        if len(prefix) != min(512, remaining):
+                            raise SecretScanRefusalError("truncated Git object")
+                        if unsupported_archive(prefix, sources):
+                            raise SecretScanRefusalError(
+                                "archive or compressed blob requires separate qua"
+                                "lification"
+                            )
+                        output.write(prefix)
+                        remaining -= len(prefix)
                     while remaining:
                         if time.monotonic() >= deadline:
                             raise SecretScanRefusalError("source extraction timeout")
-                        data = cast("BinaryIO", process.stdout).read(
+                        data = cast("Any", process.stdout).read(
                             min(1024 * 1024, remaining)
                         )
                         if not data:
                             raise SecretScanRefusalError("truncated Git object")
                         output.write(data)
                         remaining -= len(data)
-                if cast("BinaryIO", process.stdout).read(1) != b"\n":
+                if cast("Any", process.stdout).read(1) != b"\n":
                     raise SecretScanRefusalError("invalid Git object separator")
             if (
-                cast("BinaryIO", process.stdout).read(1)
+                cast("Any", process.stdout).read(1)
                 or process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0
             ):
                 raise SecretScanRefusalError("incomplete Git object extraction")
@@ -537,31 +564,43 @@ def materialize(  # noqa: C901, PLR0912, PLR0915
             if process.poll() is None:
                 process.kill()
                 process.wait()
-            cast("BinaryIO", process.stdout).close()
+            cast("Any", process.stdout).close()
     for (kind, data), (path, _) in payloads.items():
         if kind == "filename":
             path.write_bytes(data)
-            Path(path).chmod(0o600)
+            path.chmod(0o600)
     return {str(path): sources for path, sources in payloads.values()}
 
 
-def validate_diagnostics(path: Any) -> None:
-    """Refuse source/detector errors even when the native scanner exits zero.
+def validate_diagnostics(path: Any) -> Any:
+    """Refuse unknown or incomplete diagnostics even when native exits zero.
+
+    Returns:
+        Raw verified/unverified finding totals from the exact completion record.
 
     Raises:
-        SecretScanRefusal: Malformed, unknown, warning, or error diagnostics.
+        SecretScanRefusalError: Unknown schemas, skipped-source logs or resource bounds.
     """
     if path.stat().st_size > DIAGNOSTIC_LIMIT:
         raise SecretScanRefusalError("scanner diagnostic limit exceeded")
+    expected = ("running source", "finished scanning")
+    seen = 0
     with path.open() as stream:
         for line in stream:
             row = strict_json(line)
             if (
-                not isinstance(row, dict)
-                or not isinstance(row.get("level"), str)
-                or not re.fullmatch(r"(?:info(?:-[0-5])?|debug)", row["level"])
+                seen >= len(expected)
+                or not valid_lifecycle_diagnostic(row)
+                or row["msg"] != expected[seen]
             ):
                 raise SecretScanRefusalError("scanner reported incomplete detection")
+            seen += 1
+    if seen != len(expected):
+        raise SecretScanRefusalError("scanner reported incomplete detection")
+    return {
+        "verified": row["verified_secrets"],
+        "unverified": row["unverified_secrets"],
+    }
 
 
 def run_bounded_scanner(
@@ -727,8 +766,8 @@ def scan(  # noqa: C901, PLR0912, PLR0915
         A redacted pass, failure or error report.
 
     Raises:
-        SecretScanRefusal: Invalid or incomplete evidence; scan captures this as an
-        error report.
+        SecretScanRefusalError: Invalid or incomplete evidence; scan captures this as
+        an error report.
     """
     report = {
         "version": 1,
@@ -806,10 +845,8 @@ def scan(  # noqa: C901, PLR0912, PLR0915
             "--results=verified,unknown,unverified,filtered_unverified",
             "--concurrency=4",
         ]
-        with tempfile.TemporaryDirectory(
-            prefix="trufflehog-private-"
-        ) as directory_name:
-            directory = Path(directory_name)
+        with tempfile.TemporaryDirectory(prefix="trufflehog-private-") as raw_directory:
+            directory = Path(raw_directory)
             deadline = time.monotonic() + timeout
             payload_directory = directory / "payloads"
             payload_directory.mkdir(mode=0o700)
@@ -833,14 +870,41 @@ def scan(  # noqa: C901, PLR0912, PLR0915
             code = run_bounded_scanner(command, environment, output, errors, deadline)
             if code != 0:
                 raise SecretScanRefusalError("scanner execution failed")
-            validate_diagnostics(errors)
+            expected_counts = validate_diagnostics(errors)
             if output.stat().st_size > OUTPUT_LIMIT:
                 raise SecretScanRefusalError("scanner output limit exceeded")
+            raw_counts = {"verified": 0, "unverified": 0}
+            with output.open() as stream:
+                for line in stream:
+                    if time.monotonic() >= deadline:
+                        raise SecretScanRefusalError(
+                            "scanner output validation timeout"
+                        )
+                    if len(line) > 8 * 1024 * 1024 or not line.strip():
+                        raise SecretScanRefusalError("invalid scanner stream")
+                    row = strict_json(line)
+                    if not isinstance(row, dict) or not isinstance(
+                        row.get("Verified"), bool
+                    ):
+                        raise SecretScanRefusalError(
+                            "invalid raw detection verification state"
+                        )
+                    # Pinned engine metrics count raw dispatched JSON rows before
+                    # association expansion.
+                    raw_counts["verified" if row["Verified"] else "unverified"] += 1
+            if raw_counts != expected_counts:
+                raise SecretScanRefusalError(
+                    "scanner finding output does not match completion metrics"
+                )
+            # Stream the same private, completed file again; no raw rows are retained
+            # in memory.
             blocked, suppressed = 0, 0
             with output.open() as stream:
                 for line in stream:
-                    if len(line) > 8 * 1024 * 1024 or not line.strip():
-                        raise SecretScanRefusalError("invalid scanner stream")
+                    if time.monotonic() >= deadline:
+                        raise SecretScanRefusalError(
+                            "scanner output validation timeout"
+                        )
                     row = strict_json(line)
                     try:
                         location = row["SourceMetadata"]["Data"]["Filesystem"]
@@ -862,7 +926,7 @@ def scan(  # noqa: C901, PLR0912, PLR0915
                             suppressed += 1
                         else:
                             blocked += 1
-                        if len(report["findings"]) < REPORT_FINDING_LIMIT:
+                        if len(report["findings"]) < REDACTED_FINDING_BOUND:
                             report["findings"].append(finding)
             report.update(
                 {
@@ -1439,6 +1503,175 @@ def main() -> int:  # noqa: C901, PLR0915
         )
         return 1
     return 0
+
+
+def unsupported_archive(prefix: Any, sources: Any) -> Any:
+    """Refuse recognized archive/compressed blobs, including malformed headers.
+
+    The pinned extractor silently skips some members. Inspect at most the first
+    512 raw bytes and retained original names without decompressing or extracting.
+    Signature-free Brotli and legacy TAR need name/header checks. This is a
+    conservative refusal, never evidence that arbitrary encoded data was decoded.
+
+    Returns:
+        Whether this blob requires separate archive-content qualification.
+    """
+    extensions = {
+        ".7z",
+        ".zip",
+        ".rar",
+        ".tar",
+        ".gz",
+        ".tgz",
+        ".bz2",
+        ".tbz",
+        ".tbz2",
+        ".xz",
+        ".txz",
+        ".lz4",
+        ".lz",
+        ".tlz",
+        ".zst",
+        ".tzst",
+        ".zz",
+        ".zlib",
+        ".br",
+        ".sz",
+        ".s2",
+        ".z",
+        ".ar",
+        ".deb",
+        ".rpm",
+        ".apk",
+        ".jar",
+        ".whl",
+    }
+    if any(Path(source["file"]).suffix.lower() in extensions for source in sources):
+        return True
+    signatures = (
+        b"PK\x03\x04",
+        b"PK\x05\x06",
+        b"PK\x07\x08",
+        b"7z\xbc\xaf\x27\x1c",
+        b"Rar!\x1a\x07\x00",
+        b"Rar!\x1a\x07\x01\x00",
+        b"\x1f\x8b",
+        b"BZh",
+        b"\xfd7zXZ\x00",
+        b"\x04\x22\x4d\x18",
+        b"\x02\x21\x4c\x18",
+        b"LZIP",
+        b"\x28\xb5\x2f\xfd",
+        b"\xff\x06\x00\x00sNaPpY",
+        b"\xff\x06\x00\x00S2sTwO",
+        b"!<arch>\n",
+        b"\xed\xab\xee\xdb",
+        b"070701",
+        b"070702",
+        b"070707",
+        b"\x71\xc7",
+        b"\xc7\x71",
+        b"\x1f\x9d",
+        b"MSCF",
+        b"xar!",
+    )
+    if prefix.startswith(signatures) or prefix[257:262] == b"ustar":
+        return True
+    # Zstandard/LZ4 skippable frames can precede real frames.
+    if (
+        len(prefix) >= FRAME_PREFIX_BYTES
+        and SKIPPABLE_FRAME_MIN <= prefix[0] <= SKIPPABLE_FRAME_MAX
+        and prefix[1:4] == b"\x2a\x4d\x18"
+    ):
+        return True
+    # RFC 1950 DEFLATE headers, including dictionary-bearing variants, have a checksum.
+    if (
+        len(prefix) >= ZLIB_HEADER_BYTES
+        and prefix[0] & 15 == DEFLATE_METHOD
+        and prefix[0] >> 4 <= MAX_WINDOW_LOG
+        and int.from_bytes(prefix[:2], "big") % 31 == 0
+    ):
+        return True
+    if len(prefix) >= ARCHIVE_PREFIX_BYTES:
+        checksum = prefix[148:156].strip(b"\x00 ")
+        if checksum and all(
+            OCTAL_ASCII_MIN <= value <= OCTAL_ASCII_MAX for value in checksum
+        ):
+            expected = int(checksum, 8)
+            data = prefix[:148] + b" " * 8 + prefix[156:512]
+            # Legacy V7 TAR has no magic; accept both historic checksum conventions.
+            if expected in {
+                sum(data),
+                sum(
+                    value if value < SIGNED_BYTE_THRESHOLD else value - 256
+                    for value in data
+                ),
+            }:
+                return True
+    return False
+
+
+def valid_lifecycle_diagnostic(row: Any) -> Any:  # noqa: PLR0911
+    """Accept only exact v3.99.2 offline filesystem lifecycle log schemas.
+
+    No message is accepted by log level alone, including debug/info skip reports.
+    Extra error fields, incomplete records and unrecognized messages are refused.
+
+    Returns:
+        Whether all fields match a known pinned lifecycle schema.
+    """
+    common = {"level", "ts", "logger", "msg"}
+    if (
+        not isinstance(row, dict)
+        or row.get("level") != "info-0"
+        or row.get("logger") != "trufflehog"
+    ):
+        return False
+    stamp = row.get("ts")
+    if not isinstance(stamp, str) or not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})",
+        stamp,
+    ):
+        return False
+    try:
+        datetime.fromisoformat(stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp)
+    except ValueError:
+        return False
+    if row.get("msg") == "running source":
+        worker = row.get("source_manager_worker_id")
+        return (
+            set(row) == common | {"source_manager_worker_id", "with_units"}
+            and row["with_units"] is True
+            and isinstance(worker, str)
+            and re.fullmatch(r"[A-Za-z0-9]{5}", worker) is not None
+        )
+    counts = {"chunks", "bytes", "verified_secrets", "unverified_secrets"}
+    if row.get("msg") != "finished scanning" or set(row) != common | counts | {
+        "scan_duration",
+        "trufflehog_version",
+        "verification_caching",
+    }:
+        return False
+    if any(type(row[key]) is not int or row[key] < 0 for key in counts):
+        return False
+    duration = row["scan_duration"]
+    if (
+        row["trufflehog_version"] != "3.99.2"
+        or not isinstance(duration, str)
+        or not re.fullmatch(
+            r"(?:(?:[0-9]+h)?(?:[0-9]+m)?[0-9]+(?:\.[0-9]+)?s|[0-9]+(?:\.[0-9]+)?(?:ms|µs|ns))",
+            duration,
+        )
+    ):
+        return False
+    cache = row["verification_caching"]
+    return (
+        isinstance(cache, dict)
+        and set(cache)
+        == {"Hits", "Misses", "HitsWasted", "AttemptsSaved", "VerificationTimeSpentMS"}
+        and all(type(value) is int and value >= 0 for value in cache.values())
+    )
 
 
 if __name__ == "__main__":
